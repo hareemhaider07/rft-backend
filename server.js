@@ -16,7 +16,7 @@ const kycRoutes = require('./routes/kyc');
 const app = express();
 
 // Trust proxy for Railway/deployment
-app.set('trust proxy', true);
+app.set('trust proxy', 1);
 
 // Security middleware
 app.use(helmet());
@@ -29,6 +29,14 @@ const corsOptions = {
   allowedHeaders: ['Content-Type', 'Authorization']
 };
 app.use(cors(corsOptions));
+
+// Health check endpoint (before rate limiter for Railway)
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    message: 'RFT Entertainment API is running'
+  });
+});
 
 // Rate limiting
 const limiter = rateLimit({
