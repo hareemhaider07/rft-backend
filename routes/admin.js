@@ -101,7 +101,7 @@ router.post('/auth/login', async (req, res) => {
       'SELECT * FROM admin_users WHERE username=$1 OR email=$2', [username, username]
     );
     if (!r.rows.length) {
-      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+      return res.status(401).json({ success: false, message: 'Invalid credentials - user not found' });
     }
     const admin = r.rows[0];
     if (!admin.is_active) {
@@ -109,7 +109,7 @@ router.post('/auth/login', async (req, res) => {
     }
     const valid = await bcrypt.compare(password, admin.password_hash);
     if (!valid) {
-      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+      return res.status(401).json({ success: false, message: 'Invalid credentials - wrong password' });
     }
     // update last login — wrapped separately so a missing column doesn't break login
     try {
@@ -125,7 +125,13 @@ router.post('/auth/login', async (req, res) => {
     });
   } catch (err) {
     console.error('Admin login error:', err);
-    res.status(500).json({ success: false, message: 'Login failed' });
+    // Return the actual error message in non-production so we can debug
+    res.status(500).json({
+      success: false,
+      message: 'Login failed',
+      error: err.message,
+      detail: err.detail || null
+    });
   }
 });
 
