@@ -111,7 +111,10 @@ router.post('/auth/login', async (req, res) => {
     if (!valid) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
-    await pool.query('UPDATE admin_users SET last_login_at=NOW() WHERE id=$1', [admin.id]);
+    // update last login — wrapped separately so a missing column doesn't break login
+    try {
+      await pool.query('UPDATE admin_users SET last_login_at=NOW() WHERE id=$1', [admin.id]);
+    } catch (_) {}
     const tokens = makeAdminTokens(admin.id);
     res.json({
       success: true,
