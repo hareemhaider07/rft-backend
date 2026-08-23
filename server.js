@@ -5,6 +5,15 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
 
+// ── Startup env check — shows a clear error in Railway logs ──────────────────
+const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET'];
+const missing = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missing.length) {
+  console.error('❌ MISSING ENVIRONMENT VARIABLES:', missing.join(', '));
+  console.error('   Set these in Railway → your service → Variables tab');
+  process.exit(1);
+}
+
 const app = express();
 
 // Trust proxy (Railway)
