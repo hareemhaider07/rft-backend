@@ -19,19 +19,33 @@ const app = express();
 // Trust proxy (Railway)
 app.set('trust proxy', 1);
 
-// Security
-app.use(helmet());
+// Health check — before EVERYTHING so Railway healthcheck always gets a 200
+// even if CORS, auth, or any other middleware has a problem
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', message: 'RFT Entertainment API is running' });
+});
 
-// CORS
+// CORS — parse CORS_ORIGIN safely so stray quotes/newlines never crash the server
+const rawOrigin = (process.env.CORS_ORIGIN || '').trim().replace(/^["']|["']$/g, '');
+const allowedOrigins = rawOrigin
+  ? rawOrigin.split(',').map(o => o.trim().replace(/^["']|["']$/g, '')).filter(Boolean)
+  : [];
+
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || '*',
+  origin: (origin, callback) => {
+    // allow non-browser requests (curl, Railway healthcheck, Postman)
+    if (!origin) return callback(null, true);
+    // allow everything if no origins configured
+    if (allowedOrigins.length === 0) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    // block unknown origins in production, allow in dev
+    if (process.env.NODE_ENV !== 'production') return callback(null, true);
+    callback(new Error(`CORS: origin ${origin} not allowed`));
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
-
-// Health (before rate limiter)
-app.get('/health', (req, res) => res.status(200).json({ status: 'ok', message: 'RFT Entertainment API is running' }));
 
 // Rate limiting
 app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 200 }));
