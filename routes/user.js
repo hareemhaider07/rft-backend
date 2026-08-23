@@ -5,38 +5,27 @@ const { authenticate } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Get user profile
+// GET /api/user/profile
 router.get('/profile', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, name, email, phone, residence, occupation, whatsapp, age, gender, 
-              kyc_status, balance_usdt, points, referral_code, referred_by, 
-              is_active, is_verified, last_login_at, created_at
+      `SELECT id, name, email, phone, residence, occupation, whatsapp, age, gender,
+              kyc_status, balance_usdt, frozen_usdt, points, vip_level,
+              referral_code, referred_by, is_active, is_verified, last_login_at, created_at
        FROM users WHERE id = $1`,
       [req.user.id]
     );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
+    if (!result.rows.length) {
+      return res.status(404).json({ success: false, message: 'User not found' });
     }
-
-    res.json({
-      success: true,
-      data: result.rows[0]
-    });
+    res.json({ success: true, data: result.rows[0] });
   } catch (error) {
     console.error('Get profile error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch profile'
-    });
+    res.status(500).json({ success: false, message: 'Failed to fetch profile' });
   }
 });
 
-// Update user profile
+// PUT /api/user/profile
 router.put('/profile', authenticate, [
   body('name').optional().trim(),
   body('residence').optional().trim(),
@@ -48,110 +37,111 @@ router.put('/profile', authenticate, [
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Validation failed',
-        errors: errors.array()
-      });
+      return res.status(400).json({ success: false, message: errors.array()[0].msg });
     }
-
     const { name, residence, occupation, whatsapp, age, gender } = req.body;
-
     const result = await pool.query(
-      `UPDATE users 
-       SET name = COALESCE($1, name),
-           residence = COALESCE($2, residence),
-           occupation = COALESCE($3, occupation),
-           whatsapp = COALESCE($4, whatsapp),
-           age = COALESCE($5, age),
-           gender = COALESCE($6, gender),
-           updated_at = NOW()
-       WHERE id = $7
+      `UPDATE users
+       SET name=COALESCE($1,name), residence=COALESCE($2,residence),
+           occupation=COALESCE($3,occupation), whatsapp=COALESCE($4,whatsapp),
+           age=COALESCE($5,age), gender=COALESCE($6,gender), updated_at=NOW()
+       WHERE id=$7
        RETURNING id, name, email, phone, residence, occupation, whatsapp, age, gender`,
       [name, residence, occupation, whatsapp, age, gender, req.user.id]
     );
-
-    res.json({
-      success: true,
-      message: 'Profile updated successfully',
-      data: result.rows[0]
-    });
+    res.json({ success: true, message: 'Profile updated', data: result.rows[0] });
   } catch (error) {
     console.error('Update profile error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to update profile'
-    });
+    res.status(500).json({ success: false, message: 'Failed to update profile' });
   }
 });
 
-// Get user stats
+// GET /api/user/stats  — uses daily_task_tracking (fixed from old user_tasks)
 router.get('/stats', authenticate, async (req, res) => {
   try {
     const userId = req.user.id;
+    const today  = new Date().toISOString().split('T')[0];
 
-    // Get task completion stats
-    const today = new Date().toISOString().split('T')[0];
-    const taskStats = await pool.query(
-      `SELECT 
-         COUNT(*) as total_completed,
-         COUNT(*) FILTER (WHERE DATE(created_at) = $1) as completed_today
-       FROM user_tasks 
-       WHERE user_id = $2 AND status = 'completed'`,
-      [today, userId]
-    );
+    const [taskAll, taskToday, earnedAll, earnedToday, referralCount] = await Promise.all([
+      pool.query(
+        `SELECT COUNT(*) AS cnt FROM daily_task_tracking WHERE user_id=$1 AND status='completed'`,
+        [userId]
+      ),
+      pool.query(
+        `SELECT COUNT(*) AS cnt FROM daily_task_tracking WHERE user_id=$1 AND task_date=$2 AND status='completed'`,
+        [userId, today]
+      ),
+      pool.query(
+        `SELECT COALESCE(SUM(reward_usdt),0) AS total FROM daily_task_tracking WHERE user_id=$1 AND status='completed'`,
+        [userId]
+      ),
+      pool.query(
+        `SELECT COALESCE(SUM(reward_usdt),0) AS total FROM daily_task_tracking WHERE user_id=$1 AND task_date=$2 AND status='completed'`,
+        [userId, today]
+      ),
+      pool.query(
+        `SELECT COUNT(*) AS cnt FROM referrals WHERE referrer_id=$1 AND referral_level=1`,
+        [userId]
+      )
+    ]);
 
-    // Get total earned
-    const earnedResult = await pool.query(
-      `SELECT COALESCE(SUM(reward_usdt), 0) as total_earned
-       FROM user_tasks 
-       WHERE user_id = $1 AND status = 'completed'`,
-      [userId]
-    );
+    // get VIP daily limit
+    const userRes = await pool.query('SELECT vip_level FROM users WHERE id=$1', [userId]);
+    const vipLevel = userRes.rows[0]?.vip_level || 0;
+    const vipRes = await pool.query('SELECT daily_task_limit FROM vip_levels WHERE level=$1', [vipLevel]);
+    const dailyLimit = vipRes.rows[0]?.daily_task_limit || 10;
 
-    // Get today's earned
-    const todayEarnedResult = await pool.query(
-      `SELECT COALESCE(SUM(reward_usdt), 0) as today_earned
-       FROM user_tasks 
-       WHERE user_id = $1 AND status = 'completed' AND DATE(created_at) = $2`,
-      [userId, today]
-    );
-
-    // Get referral count
-    const referralResult = await pool.query(
-      `SELECT COUNT(*) as referral_count
-       FROM users 
-       WHERE referred_by = $1`,
-      [req.user.referral_code]
-    );
-
-    const stats = taskStats.rows[0];
-    const earned = earnedResult.rows[0];
-    const todayEarned = todayEarnedResult.rows[0];
-    const referrals = referralResult.rows[0];
-
-    const dailyLimit = parseInt(process.env.DAILY_TASK_LIMIT) || 10;
-    const taskReward = parseFloat(process.env.TASK_REWARD_USDT) || 0.1;
+    const completedToday = parseInt(taskToday.rows[0].cnt);
 
     res.json({
       success: true,
       data: {
-        total_tasks_completed: parseInt(stats.total_completed),
-        tasks_today: parseInt(stats.completed_today),
-        tasks_remaining: Math.max(0, dailyLimit - parseInt(stats.completed_today)),
-        daily_limit: dailyLimit,
-        total_earned_usdt: parseFloat(earned.total_earned),
-        today_earned_usdt: parseFloat(todayEarned.today_earned),
-        referral_count: parseInt(referrals.referral_count),
-        referral_bonus_usdt: parseInt(referrals.referral_count) * 0.5 // 0.50 USDT per referral
+        total_tasks_completed: parseInt(taskAll.rows[0].cnt),
+        tasks_today:           completedToday,
+        tasks_remaining:       dailyLimit === 0 ? 999 : Math.max(0, dailyLimit - completedToday),
+        daily_limit:           dailyLimit,
+        total_earned_usdt:     parseFloat(earnedAll.rows[0].total),
+        today_earned_usdt:     parseFloat(earnedToday.rows[0].total),
+        referral_count:        parseInt(referralCount.rows[0].cnt)
       }
     });
   } catch (error) {
     console.error('Get stats error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch stats'
-    });
+    res.status(500).json({ success: false, message: 'Failed to fetch stats' });
+  }
+});
+
+// GET /api/user/leaderboard  — top earners this week (real data)
+router.get('/leaderboard', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT u.name, u.referral_code, u.vip_level,
+              COALESCE(SUM(d.reward_usdt), 0) AS week_earned
+       FROM daily_task_tracking d
+       JOIN users u ON u.id = d.user_id
+       WHERE d.task_date >= CURRENT_DATE - INTERVAL '7 days'
+         AND d.status = 'completed'
+         AND u.is_active = true
+       GROUP BY u.id, u.name, u.referral_code, u.vip_level
+       ORDER BY week_earned DESC
+       LIMIT 10`
+    );
+
+    const pkrRate = parseFloat(process.env.PKR_RATE) || 280;
+    const leaders = result.rows.map((r, i) => ({
+      rank:         i + 1,
+      display_name: r.name
+        ? r.name.split(' ')[0].charAt(0) + '***' + (r.name.split(' ')[0].slice(-1) || '')
+        : '•••' + (r.referral_code || '').slice(-3),
+      vip_level:    r.vip_level || 0,
+      week_earned:  parseFloat(r.week_earned).toFixed(2),
+      week_earned_pkr: (r.week_earned * pkrRate).toFixed(0)
+    }));
+
+    res.json({ success: true, data: leaders });
+  } catch (error) {
+    console.error('Leaderboard error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch leaderboard' });
   }
 });
 

@@ -1,0 +1,698 @@
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { body, validationResult } = require('express-validator');
+const pool = require('../config/database');
+
+const router = express.Router();
+
+// ── Admin auth middleware ─────────────────────────────────────────────────────
+const adminAuth = async (req, res, next) => {
+  try {
+    const header = req.headers.authorization;
+    if (!header || !header.startsWith('Bearer ')) {
+      return res.status(401).json({ success: false, message: 'No admin token' });
+    }
+    const decoded = jwt.verify(header.substring(7), process.env.JWT_SECRET);
+    if (!decoded.adminId) {
+      return res.status(401).json({ success: false, message: 'Not an admin token' });
+    }
+    const r = await pool.query(
+      'SELECT id, username, email, role, is_active FROM admin_users WHERE id = $1',
+      [decoded.adminId]
+    );
+    if (!r.rows.length || !r.rows[0].is_active) {
+      return res.status(401).json({ success: false, message: 'Admin not found or inactive' });
+    }
+    req.admin = r.rows[0];
+    next();
+  } catch (err) {
+    return res.status(401).json({ success: false, message: 'Invalid admin token' });
+  }
+};
+
+const makeAdminTokens = (adminId) => ({
+  access_token:  jwt.sign({ adminId }, process.env.JWT_SECRET, { expiresIn: '8h' }),
+  refresh_token: jwt.sign({ adminId }, process.env.JWT_SECRET, { expiresIn: '7d' })
+});
+
+// helper: auto-upgrade VIP after deposit approved
+async function autoUpgradeVip(userId) {
+  try {
+    const dep = await pool.query(
+      `SELECT COALESCE(SUM(amount_usdt),0) AS total FROM transactions
+       WHERE user_id=$1 AND type='recharge' AND status='completed'`, [userId]
+    );
+    const total = parseFloat(dep.rows[0].total);
+    const lv = await pool.query(
+      `SELECT level FROM vip_levels WHERE is_active=true AND required_deposit_usdt<=$1
+       ORDER BY level DESC LIMIT 1`, [total]
+    );
+    const newLevel = lv.rows.length ? lv.rows[0].level : 0;
+    const cur = await pool.query('SELECT vip_level FROM users WHERE id=$1', [userId]);
+    const oldLevel = cur.rows[0]?.vip_level || 0;
+    if (newLevel > oldLevel) {
+      await pool.query('UPDATE users SET vip_level=$1 WHERE id=$2', [newLevel, userId]);
+      await pool.query(
+        `INSERT INTO notifications(user_id,title,message,type) VALUES($1,$2,$3,'success')`,
+        [userId, `🎉 VIP ${newLevel} Unlocked!`,
+         `Congratulations! You have been upgraded to VIP ${newLevel}. Enjoy higher rewards.`]
+      );
+    }
+  } catch (e) { console.error('autoUpgradeVip:', e); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTH
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /api/admin/auth/setup  — create first admin (one-time only)
+router.post('/auth/setup', async (req, res) => {
+  try {
+    const existing = await pool.query('SELECT id FROM admin_users LIMIT 1');
+    if (existing.rows.length) {
+      return res.status(403).json({ success: false, message: 'Admin already exists. Use login.' });
+    }
+    const { username, email, password } = req.body;
+    if (!username || !email || !password) {
+      return res.status(400).json({ success: false, message: 'username, email, password required' });
+    }
+    const hash = await bcrypt.hash(password, 10);
+    const r = await pool.query(
+      `INSERT INTO admin_users(username,email,password_hash,role)
+       VALUES($1,$2,$3,'superadmin') RETURNING id,username,email`,
+      [username, email, hash]
+    );
+    res.status(201).json({ success: true, message: 'Admin created', data: r.rows[0] });
+  } catch (err) {
+    console.error('Admin setup error:', err);
+    res.status(500).json({ success: false, message: 'Setup failed' });
+  }
+});
+
+// POST /api/admin/auth/login
+router.post('/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ success: false, message: 'Username and password required' });
+    }
+    const r = await pool.query(
+      'SELECT * FROM admin_users WHERE username=$1 OR email=$2', [username, username]
+    );
+    if (!r.rows.length) {
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+    const admin = r.rows[0];
+    if (!admin.is_active) {
+      return res.status(401).json({ success: false, message: 'Account inactive' });
+    }
+    const valid = await bcrypt.compare(password, admin.password_hash);
+    if (!valid) {
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+    await pool.query('UPDATE admin_users SET last_login_at=NOW() WHERE id=$1', [admin.id]);
+    const tokens = makeAdminTokens(admin.id);
+    res.json({
+      success: true,
+      data: {
+        admin: { id: admin.id, username: admin.username, email: admin.email, role: admin.role },
+        ...tokens
+      }
+    });
+  } catch (err) {
+    console.error('Admin login error:', err);
+    res.status(500).json({ success: false, message: 'Login failed' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/dashboard', adminAuth, async (req, res) => {
+  try {
+    const pkrRate = parseFloat(process.env.PKR_RATE) || 280;
+    const [
+      users, pendingDep, pendingWit, pendingKyc,
+      totDep, totWit, todayTasks, activeUsers
+    ] = await Promise.all([
+      pool.query('SELECT COUNT(*) AS cnt FROM users'),
+      pool.query(`SELECT COUNT(*) AS cnt FROM transactions WHERE type='recharge'   AND status='pending'`),
+      pool.query(`SELECT COUNT(*) AS cnt FROM transactions WHERE type='withdrawal' AND status='pending'`),
+      pool.query(`SELECT COUNT(*) AS cnt FROM kyc_documents WHERE verification_status='pending'`),
+      pool.query(`SELECT COALESCE(SUM(amount_usdt),0) AS t FROM transactions WHERE type='recharge'   AND status='completed'`),
+      pool.query(`SELECT COALESCE(SUM(amount_usdt),0) AS t FROM transactions WHERE type='withdrawal' AND status='completed'`),
+      pool.query(`SELECT COALESCE(SUM(reward_usdt),0) AS t FROM daily_task_tracking WHERE task_date=CURRENT_DATE AND status='completed'`),
+      pool.query(`SELECT COUNT(*) AS cnt FROM users WHERE last_login_at > NOW() - INTERVAL '7 days'`)
+    ]);
+
+    const vipDist = await pool.query(
+      `SELECT vip_level, COUNT(*) AS cnt FROM users GROUP BY vip_level ORDER BY vip_level`
+    );
+    const recentTx = await pool.query(
+      `SELECT t.id,t.type,t.amount_usdt,t.status,t.created_at,u.name,u.phone
+       FROM transactions t JOIN users u ON u.id=t.user_id
+       ORDER BY t.created_at DESC LIMIT 10`
+    );
+
+    res.json({
+      success: true,
+      data: {
+        stats: {
+          total_users:           parseInt(users.rows[0].cnt),
+          active_users_7d:       parseInt(activeUsers.rows[0].cnt),
+          pending_deposits:      parseInt(pendingDep.rows[0].cnt),
+          pending_withdrawals:   parseInt(pendingWit.rows[0].cnt),
+          pending_kyc:           parseInt(pendingKyc.rows[0].cnt),
+          total_deposited_usdt:  parseFloat(totDep.rows[0].t),
+          total_withdrawn_usdt:  parseFloat(totWit.rows[0].t),
+          total_deposited_pkr:   (totDep.rows[0].t * pkrRate).toFixed(2),
+          total_withdrawn_pkr:   (totWit.rows[0].t * pkrRate).toFixed(2),
+          today_task_rewards:    parseFloat(todayTasks.rows[0].t)
+        },
+        vip_distribution: vipDist.rows,
+        recent_transactions: recentTx.rows
+      }
+    });
+  } catch (err) {
+    console.error('Dashboard error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch dashboard' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// USERS
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/users', adminAuth, async (req, res) => {
+  try {
+    const page   = parseInt(req.query.page)  || 1;
+    const limit  = parseInt(req.query.limit) || 20;
+    const search = req.query.search || '';
+    const status = req.query.status || '';
+    const offset = (page - 1) * limit;
+
+    const params = [];
+    let where = 'WHERE 1=1';
+    if (search) {
+      params.push(`%${search}%`);
+      where += ` AND (u.name ILIKE $${params.length} OR u.email ILIKE $${params.length} OR u.phone ILIKE $${params.length})`;
+    }
+    if (status === 'active')   where += ' AND u.is_active=true';
+    if (status === 'inactive') where += ' AND u.is_active=false';
+
+    const result = await pool.query(
+      `SELECT u.id,u.name,u.email,u.phone,u.vip_level,u.balance_usdt,
+              u.kyc_status,u.is_active,u.created_at,u.last_login_at,u.referral_code
+       FROM users u ${where}
+       ORDER BY u.created_at DESC
+       LIMIT $${params.length+1} OFFSET $${params.length+2}`,
+      [...params, limit, offset]
+    );
+    const cnt = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM users u ${where}`, params
+    );
+    res.json({
+      success: true,
+      data: {
+        users: result.rows,
+        pagination: { page, limit, total: parseInt(cnt.rows[0].cnt), total_pages: Math.ceil(cnt.rows[0].cnt/limit) }
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to fetch users' });
+  }
+});
+
+router.get('/users/:id', adminAuth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT u.*,
+         (SELECT COALESCE(SUM(amount_usdt),0) FROM transactions WHERE user_id=u.id AND type='recharge'   AND status='completed') AS total_deposited,
+         (SELECT COALESCE(SUM(amount_usdt),0) FROM transactions WHERE user_id=u.id AND type='withdrawal' AND status='completed') AS total_withdrawn,
+         (SELECT COUNT(*) FROM referrals WHERE referrer_id=u.id) AS total_referrals
+       FROM users u WHERE u.id=$1`, [req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ success: false, message: 'User not found' });
+    res.json({ success: true, data: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to fetch user' });
+  }
+});
+
+router.put('/users/:id', adminAuth, async (req, res) => {
+  try {
+    const { is_active, vip_level, kyc_status } = req.body;
+    await pool.query(
+      `UPDATE users SET
+         is_active  = COALESCE($1, is_active),
+         vip_level  = COALESCE($2, vip_level),
+         kyc_status = COALESCE($3, kyc_status),
+         updated_at = NOW()
+       WHERE id=$4`,
+      [is_active, vip_level, kyc_status, req.params.id]
+    );
+    res.json({ success: true, message: 'User updated' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to update user' });
+  }
+});
+
+router.post('/users/:id/balance', adminAuth, async (req, res) => {
+  try {
+    const { amount_usdt, action, note } = req.body;
+    if (!amount_usdt || !action) {
+      return res.status(400).json({ success: false, message: 'amount_usdt and action (add|deduct) required' });
+    }
+    const pkrRate = parseFloat(process.env.PKR_RATE) || 280;
+    const adj = parseFloat(amount_usdt);
+    const delta = action === 'add' ? adj : -adj;
+    await pool.query(`UPDATE users SET balance_usdt=balance_usdt+$1 WHERE id=$2`, [delta, req.params.id]);
+    await pool.query(
+      `INSERT INTO transactions(user_id,type,amount_usdt,amount_pkr,status,notes,processed_by,processed_at)
+       VALUES($1,'manual_adjustment',$2,$3,'completed',$4,$5,NOW())`,
+      [req.params.id, adj, (adj*pkrRate).toFixed(2), note||`Manual ${action} by admin`, req.admin.id]
+    );
+    res.json({ success: true, message: 'Balance adjusted' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to adjust balance' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRANSACTIONS
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/transactions', adminAuth, async (req, res) => {
+  try {
+    const page   = parseInt(req.query.page)  || 1;
+    const limit  = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+    const params = [];
+    let where = 'WHERE 1=1';
+    if (req.query.type)   { params.push(req.query.type);   where += ` AND t.type=$${params.length}`; }
+    if (req.query.status) { params.push(req.query.status); where += ` AND t.status=$${params.length}`; }
+
+    const result = await pool.query(
+      `SELECT t.*,u.name,u.phone,u.email FROM transactions t
+       JOIN users u ON u.id=t.user_id
+       ${where} ORDER BY t.created_at DESC
+       LIMIT $${params.length+1} OFFSET $${params.length+2}`,
+      [...params, limit, offset]
+    );
+    const cnt = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM transactions t ${where}`, params
+    );
+    res.json({
+      success: true,
+      data: {
+        transactions: result.rows,
+        pagination: { page, limit, total: parseInt(cnt.rows[0].cnt), total_pages: Math.ceil(cnt.rows[0].cnt/limit) }
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to fetch transactions' });
+  }
+});
+
+router.post('/transactions/:id/approve', adminAuth, async (req, res) => {
+  try {
+    const tx = (await pool.query(
+      `SELECT * FROM transactions WHERE id=$1 AND type='recharge' AND status='pending'`,
+      [req.params.id]
+    )).rows[0];
+    if (!tx) return res.status(404).json({ success: false, message: 'Pending recharge not found' });
+
+    await pool.query(
+      `UPDATE transactions SET status='completed',admin_note=$1,processed_by=$2,processed_at=NOW() WHERE id=$3`,
+      [req.body.admin_note||null, req.admin.id, tx.id]
+    );
+    await pool.query(`UPDATE users SET balance_usdt=balance_usdt+$1 WHERE id=$2`, [tx.amount_usdt, tx.user_id]);
+    await autoUpgradeVip(tx.user_id);
+    await pool.query(
+      `INSERT INTO notifications(user_id,title,message,type) VALUES($1,'Deposit Approved ✅',$2,'success')`,
+      [tx.user_id, `Your deposit of ${tx.amount_usdt} USDT has been approved and credited to your wallet.`]
+    );
+    res.json({ success: true, message: 'Deposit approved and balance credited' });
+  } catch (err) {
+    console.error('Approve deposit:', err);
+    res.status(500).json({ success: false, message: 'Failed to approve deposit' });
+  }
+});
+
+router.post('/transactions/:id/reject', adminAuth, async (req, res) => {
+  try {
+    const tx = (await pool.query(
+      `SELECT * FROM transactions WHERE id=$1 AND type='recharge' AND status='pending'`,
+      [req.params.id]
+    )).rows[0];
+    if (!tx) return res.status(404).json({ success: false, message: 'Pending recharge not found' });
+
+    const reason = req.body.admin_note || 'Rejected by admin';
+    await pool.query(
+      `UPDATE transactions SET status='failed',admin_note=$1,processed_by=$2,processed_at=NOW() WHERE id=$3`,
+      [reason, req.admin.id, tx.id]
+    );
+    await pool.query(
+      `INSERT INTO notifications(user_id,title,message,type) VALUES($1,'Deposit Rejected ❌',$2,'error')`,
+      [tx.user_id, `Your deposit of ${tx.amount_usdt} USDT was rejected. Reason: ${reason}`]
+    );
+    res.json({ success: true, message: 'Deposit rejected' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to reject deposit' });
+  }
+});
+
+router.post('/transactions/:id/process', adminAuth, async (req, res) => {
+  try {
+    const tx = (await pool.query(
+      `SELECT * FROM transactions WHERE id=$1 AND type='withdrawal' AND status='pending'`,
+      [req.params.id]
+    )).rows[0];
+    if (!tx) return res.status(404).json({ success: false, message: 'Pending withdrawal not found' });
+
+    await pool.query(
+      `UPDATE transactions SET status='completed',admin_note=$1,processed_by=$2,processed_at=NOW() WHERE id=$3`,
+      [req.body.admin_note||null, req.admin.id, tx.id]
+    );
+    await pool.query(
+      `UPDATE users SET frozen_usdt=GREATEST(0,frozen_usdt-$1) WHERE id=$2`,
+      [tx.amount_usdt, tx.user_id]
+    );
+    await pool.query(
+      `INSERT INTO notifications(user_id,title,message,type) VALUES($1,'Withdrawal Processed ✅',$2,'success')`,
+      [tx.user_id, `Your withdrawal of ${tx.amount_usdt} USDT has been processed successfully.`]
+    );
+    res.json({ success: true, message: 'Withdrawal processed' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to process withdrawal' });
+  }
+});
+
+router.post('/transactions/:id/refund', adminAuth, async (req, res) => {
+  try {
+    const tx = (await pool.query(
+      `SELECT * FROM transactions WHERE id=$1 AND type='withdrawal' AND status='pending'`,
+      [req.params.id]
+    )).rows[0];
+    if (!tx) return res.status(404).json({ success: false, message: 'Pending withdrawal not found' });
+
+    const reason = req.body.admin_note || 'Rejected by admin';
+    await pool.query(
+      `UPDATE transactions SET status='failed',admin_note=$1,processed_by=$2,processed_at=NOW() WHERE id=$3`,
+      [reason, req.admin.id, tx.id]
+    );
+    await pool.query(
+      `UPDATE users SET balance_usdt=balance_usdt+$1, frozen_usdt=GREATEST(0,frozen_usdt-$1) WHERE id=$2`,
+      [tx.amount_usdt, tx.user_id]
+    );
+    await pool.query(
+      `INSERT INTO notifications(user_id,title,message,type) VALUES($1,'Withdrawal Cancelled',$2,'info')`,
+      [tx.user_id, `Your withdrawal of ${tx.amount_usdt} USDT was cancelled and refunded.`]
+    );
+    res.json({ success: true, message: 'Withdrawal rejected and amount refunded' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to refund withdrawal' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KYC
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/kyc', adminAuth, async (req, res) => {
+  try {
+    const status = req.query.status || 'pending';
+    const page   = parseInt(req.query.page)  || 1;
+    const limit  = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+
+    const r = await pool.query(
+      `SELECT k.*,u.name,u.email,u.phone FROM kyc_documents k
+       JOIN users u ON u.id=k.user_id
+       WHERE k.verification_status=$1
+       ORDER BY k.submitted_at DESC LIMIT $2 OFFSET $3`,
+      [status, limit, offset]
+    );
+    const cnt = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM kyc_documents WHERE verification_status=$1`, [status]
+    );
+    res.json({
+      success: true,
+      data: {
+        documents: r.rows,
+        pagination: { page, limit, total: parseInt(cnt.rows[0].cnt), total_pages: Math.ceil(cnt.rows[0].cnt/limit) }
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to fetch KYC' });
+  }
+});
+
+router.post('/kyc/:id/approve', adminAuth, async (req, res) => {
+  try {
+    const doc = (await pool.query('SELECT * FROM kyc_documents WHERE id=$1', [req.params.id])).rows[0];
+    if (!doc) return res.status(404).json({ success: false, message: 'Not found' });
+    await pool.query(
+      `UPDATE kyc_documents SET verification_status='verified',verified_at=NOW(),reviewed_by=$1 WHERE id=$2`,
+      [req.admin.id, doc.id]
+    );
+    await pool.query(`UPDATE users SET kyc_status='verified' WHERE id=$1`, [doc.user_id]);
+    await pool.query(
+      `INSERT INTO notifications(user_id,title,message,type) VALUES($1,'KYC Approved ✅','Your identity has been verified. You can now withdraw funds.','success')`,
+      [doc.user_id]
+    );
+    res.json({ success: true, message: 'KYC approved' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to approve KYC' });
+  }
+});
+
+router.post('/kyc/:id/reject', adminAuth, async (req, res) => {
+  try {
+    const doc = (await pool.query('SELECT * FROM kyc_documents WHERE id=$1', [req.params.id])).rows[0];
+    if (!doc) return res.status(404).json({ success: false, message: 'Not found' });
+    const reason = req.body.reason || 'Documents unclear';
+    await pool.query(
+      `UPDATE kyc_documents SET verification_status='rejected',rejection_reason=$1,reviewed_by=$2 WHERE id=$3`,
+      [reason, req.admin.id, doc.id]
+    );
+    await pool.query(`UPDATE users SET kyc_status='rejected' WHERE id=$1`, [doc.user_id]);
+    await pool.query(
+      `INSERT INTO notifications(user_id,title,message,type) VALUES($1,'KYC Rejected ❌',$2,'error')`,
+      [doc.user_id, `KYC rejected: ${reason}. Please resubmit with clearer documents.`]
+    );
+    res.json({ success: true, message: 'KYC rejected' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to reject KYC' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TASKS
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/tasks', adminAuth, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM tasks ORDER BY order_index ASC, created_at ASC');
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to fetch tasks' });
+  }
+});
+
+router.post('/tasks', adminAuth, async (req, res) => {
+  try {
+    const { title, description, thumbnail_url, video_url, task_type, reward_usdt, duration_seconds, min_vip_level, order_index } = req.body;
+    if (!title || !task_type || !reward_usdt) {
+      return res.status(400).json({ success: false, message: 'title, task_type, reward_usdt required' });
+    }
+    const r = await pool.query(
+      `INSERT INTO tasks(title,description,thumbnail_url,video_url,task_type,reward_usdt,duration_seconds,min_vip_level,order_index)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [title, description||null, thumbnail_url||null, video_url||null, task_type,
+       reward_usdt, duration_seconds||30, min_vip_level||0, order_index||0]
+    );
+    res.status(201).json({ success: true, data: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to create task' });
+  }
+});
+
+router.put('/tasks/:id', adminAuth, async (req, res) => {
+  try {
+    const { title, description, thumbnail_url, video_url, task_type, reward_usdt, duration_seconds, min_vip_level, order_index, is_active } = req.body;
+    const r = await pool.query(
+      `UPDATE tasks SET
+         title=COALESCE($1,title), description=COALESCE($2,description),
+         thumbnail_url=COALESCE($3,thumbnail_url), video_url=COALESCE($4,video_url),
+         task_type=COALESCE($5,task_type), reward_usdt=COALESCE($6,reward_usdt),
+         duration_seconds=COALESCE($7,duration_seconds), min_vip_level=COALESCE($8,min_vip_level),
+         order_index=COALESCE($9,order_index), is_active=COALESCE($10,is_active),
+         updated_at=NOW()
+       WHERE id=$11 RETURNING *`,
+      [title, description, thumbnail_url, video_url, task_type, reward_usdt,
+       duration_seconds, min_vip_level, order_index, is_active, req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ success: false, message: 'Task not found' });
+    res.json({ success: true, data: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to update task' });
+  }
+});
+
+router.delete('/tasks/:id', adminAuth, async (req, res) => {
+  try {
+    await pool.query(`UPDATE tasks SET is_active=false WHERE id=$1`, [req.params.id]);
+    res.json({ success: true, message: 'Task deactivated' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to deactivate task' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VIP LEVELS
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/vip-levels', adminAuth, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM vip_levels ORDER BY level ASC');
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to fetch VIP levels' });
+  }
+});
+
+router.put('/vip-levels/:level', adminAuth, async (req, res) => {
+  try {
+    const { daily_task_limit, task_reward_usdt, required_deposit_usdt, referral_bonus_usdt,
+            level1_commission_rate, level2_commission_rate, level3_commission_rate, min_withdraw_usdt } = req.body;
+    const r = await pool.query(
+      `UPDATE vip_levels SET
+         daily_task_limit=COALESCE($1,daily_task_limit),
+         task_reward_usdt=COALESCE($2,task_reward_usdt),
+         required_deposit_usdt=COALESCE($3,required_deposit_usdt),
+         referral_bonus_usdt=COALESCE($4,referral_bonus_usdt),
+         level1_commission_rate=COALESCE($5,level1_commission_rate),
+         level2_commission_rate=COALESCE($6,level2_commission_rate),
+         level3_commission_rate=COALESCE($7,level3_commission_rate),
+         min_withdraw_usdt=COALESCE($8,min_withdraw_usdt)
+       WHERE level=$9 RETURNING *`,
+      [daily_task_limit, task_reward_usdt, required_deposit_usdt, referral_bonus_usdt,
+       level1_commission_rate, level2_commission_rate, level3_commission_rate,
+       min_withdraw_usdt, req.params.level]
+    );
+    if (!r.rows.length) return res.status(404).json({ success: false, message: 'VIP level not found' });
+    res.json({ success: true, data: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to update VIP level' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PAYMENT METHODS (QR codes)
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/payment-methods', adminAuth, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM payment_methods ORDER BY display_order ASC');
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to fetch payment methods' });
+  }
+});
+
+router.put('/payment-methods/:id', adminAuth, async (req, res) => {
+  try {
+    const { name, account_name, account_number, qr_code_url, instructions, is_active } = req.body;
+    const r = await pool.query(
+      `UPDATE payment_methods SET
+         name=COALESCE($1,name), account_name=COALESCE($2,account_name),
+         account_number=COALESCE($3,account_number), qr_code_url=COALESCE($4,qr_code_url),
+         instructions=COALESCE($5,instructions), is_active=COALESCE($6,is_active),
+         updated_at=NOW()
+       WHERE id=$7 RETURNING *`,
+      [name, account_name, account_number, qr_code_url, instructions, is_active, req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ success: false, message: 'Payment method not found' });
+    res.json({ success: true, data: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to update payment method' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ANNOUNCEMENTS
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/announcements', adminAuth, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM announcements ORDER BY created_at DESC');
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to fetch announcements' });
+  }
+});
+
+router.post('/announcements', adminAuth, async (req, res) => {
+  try {
+    const { title, content, type, target_vip_level, expires_at } = req.body;
+    if (!title || !content) {
+      return res.status(400).json({ success: false, message: 'title and content required' });
+    }
+    const r = await pool.query(
+      `INSERT INTO announcements(title,content,type,target_vip_level,created_by,expires_at)
+       VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [title, content, type||'info', target_vip_level||-1, req.admin.id, expires_at||null]
+    );
+
+    // push notification to all (or targeted) users
+    let userQuery = 'SELECT id FROM users WHERE is_active=true';
+    const userParams = [];
+    if (target_vip_level >= 0) {
+      userParams.push(target_vip_level);
+      userQuery += ` AND vip_level=$1`;
+    }
+    const users = await pool.query(userQuery, userParams);
+    for (const u of users.rows) {
+      await pool.query(
+        `INSERT INTO notifications(user_id,title,message,type) VALUES($1,$2,$3,$4)`,
+        [u.id, title, content, type||'info']
+      );
+    }
+
+    res.status(201).json({ success: true, data: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to create announcement' });
+  }
+});
+
+router.put('/announcements/:id', adminAuth, async (req, res) => {
+  try {
+    const { title, content, is_active } = req.body;
+    const r = await pool.query(
+      `UPDATE announcements SET
+         title=COALESCE($1,title), content=COALESCE($2,content),
+         is_active=COALESCE($3,is_active)
+       WHERE id=$4 RETURNING *`,
+      [title, content, is_active, req.params.id]
+    );
+    res.json({ success: true, data: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to update announcement' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NOTIFICATIONS (send to specific user)
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/notify', adminAuth, async (req, res) => {
+  try {
+    const { user_id, title, message, type } = req.body;
+    if (!user_id || !title || !message) {
+      return res.status(400).json({ success: false, message: 'user_id, title, message required' });
+    }
+    await pool.query(
+      `INSERT INTO notifications(user_id,title,message,type) VALUES($1,$2,$3,$4)`,
+      [user_id, title, message, type||'info']
+    );
+    res.json({ success: true, message: 'Notification sent' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to send notification' });
+  }
+});
+
+module.exports = router;

@@ -6,301 +6,274 @@ const { uploadSingle } = require('../middleware/upload');
 
 const router = express.Router();
 
-// Get wallet balance
+const pkrRate = () => parseFloat(process.env.PKR_RATE) || 280;
+
+// ── GET /api/wallet/balance ───────────────────────────────────────────────────
 router.get('/balance', authenticate, async (req, res) => {
   try {
     const userId = req.user.id;
-    const pkrRate = parseFloat(process.env.PKR_RATE) || 280;
 
     const result = await pool.query(
-      `SELECT balance_usdt, points FROM users WHERE id = $1`,
+      `SELECT balance_usdt, frozen_usdt, points, vip_level FROM users WHERE id = $1`,
       [userId]
     );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
+    if (!result.rows.length) {
+      return res.status(404).json({ success: false, message: 'User not found' });
     }
-
     const user = result.rows[0];
 
-    // Get total earned and withdrawn
     const statsResult = await pool.query(
-      `SELECT 
-         COALESCE(SUM(CASE WHEN type = 'task_reward' THEN amount_usdt ELSE 0 END), 0) as total_earned,
-         COALESCE(SUM(CASE WHEN type = 'withdrawal' AND status = 'completed' THEN amount_usdt ELSE 0 END), 0) as total_withdrawn
-       FROM transactions 
-       WHERE user_id = $1`,
+      `SELECT
+         COALESCE(SUM(CASE WHEN type = 'task_reward' THEN amount_usdt ELSE 0 END), 0)        AS total_earned,
+         COALESCE(SUM(CASE WHEN type = 'withdrawal'  AND status = 'completed' THEN amount_usdt ELSE 0 END), 0) AS total_withdrawn,
+         COALESCE(SUM(CASE WHEN type = 'recharge'    AND status = 'completed' THEN amount_usdt ELSE 0 END), 0) AS total_recharged,
+         COALESCE(SUM(CASE WHEN type = 'referral_commission' THEN amount_usdt ELSE 0 END), 0) AS total_referral
+       FROM transactions WHERE user_id = $1`,
       [userId]
     );
-
-    const stats = statsResult.rows[0];
+    const s = statsResult.rows[0];
 
     res.json({
       success: true,
       data: {
         balance_usdt: parseFloat(user.balance_usdt),
-        balance_pkr: (user.balance_usdt * pkrRate).toFixed(2),
+        balance_pkr: (user.balance_usdt * pkrRate()).toFixed(2),
+        frozen_usdt: parseFloat(user.frozen_usdt || 0),
         points: user.points,
-        frozen_usdt: 0,
-        total_earned_usdt: parseFloat(stats.total_earned),
-        total_withdrawn_usdt: parseFloat(stats.total_withdrawn)
+        vip_level: user.vip_level || 0,
+        total_earned_usdt: parseFloat(s.total_earned),
+        total_withdrawn_usdt: parseFloat(s.total_withdrawn),
+        total_recharged_usdt: parseFloat(s.total_recharged),
+        total_referral_usdt: parseFloat(s.total_referral)
       }
     });
   } catch (error) {
     console.error('Get balance error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch balance'
-    });
+    res.status(500).json({ success: false, message: 'Failed to fetch balance' });
   }
 });
 
-// Get transaction history
+// ── GET /api/wallet/transactions ──────────────────────────────────────────────
 router.get('/transactions', authenticate, async (req, res) => {
   try {
     const userId = req.user.id;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const type = req.query.type;
+    const page   = parseInt(req.query.page)  || 1;
+    const limit  = parseInt(req.query.limit) || 20;
+    const type   = req.query.type || null;
     const offset = (page - 1) * limit;
-    const pkrRate = parseFloat(process.env.PKR_RATE) || 280;
 
-    let query = `
-      SELECT id, type, amount_usdt, amount_pkr, payment_method, status, notes, created_at
-      FROM transactions 
-      WHERE user_id = $1
-    `;
+    let query  = `SELECT id, type, amount_usdt, amount_pkr, payment_method, status, notes, created_at
+                  FROM transactions WHERE user_id = $1`;
     const params = [userId];
 
-    if (type) {
-      query += ` AND type = $2`;
-      params.push(type);
-    }
-
+    if (type) { query += ` AND type = $${params.length + 1}`; params.push(type); }
     query += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(limit, offset);
 
     const result = await pool.query(query, params);
 
-    // Get total count
-    let countQuery = `SELECT COUNT(*) FROM transactions WHERE user_id = $1`;
-    const countParams = [userId];
-    if (type) {
-      countQuery += ` AND type = $2`;
-      countParams.push(type);
-    }
-
-    const countResult = await pool.query(countQuery, countParams);
+    let countQ = `SELECT COUNT(*) FROM transactions WHERE user_id = $1`;
+    const cParams = [userId];
+    if (type) { countQ += ` AND type = $2`; cParams.push(type); }
+    const countResult = await pool.query(countQ, cParams);
     const total = parseInt(countResult.rows[0].count);
 
     const transactions = result.rows.map(tx => ({
       ...tx,
-      amount_pkr: tx.amount_pkr || (tx.amount_usdt * pkrRate).toFixed(2)
+      amount_pkr: tx.amount_pkr || (tx.amount_usdt * pkrRate()).toFixed(2)
     }));
 
     res.json({
       success: true,
       data: {
         transactions,
-        pagination: {
-          page,
-          limit,
-          total,
-          total_pages: Math.ceil(total / limit)
-        }
+        pagination: { page, limit, total, total_pages: Math.ceil(total / limit) }
       }
     });
   } catch (error) {
     console.error('Get transactions error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch transactions'
-    });
+    res.status(500).json({ success: false, message: 'Failed to fetch transactions' });
   }
 });
 
-// Recharge with bank transfer screenshot
+// ── GET /api/wallet/payment-info ──────────────────────────────────────────────
+// Returns all active payment methods with account details and QR codes
+router.get('/payment-info', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, identifier, account_name, account_number,
+              qr_code_url, instructions, icon, color
+       FROM payment_methods
+       WHERE is_active = true
+       ORDER BY display_order ASC`
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Get payment info error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch payment info' });
+  }
+});
+
+// ── POST /api/wallet/recharge ─────────────────────────────────────────────────
 router.post('/recharge', authenticate, [
-  body('amount_usdt').isFloat({ min: parseFloat(process.env.MIN_RECHARGE_USDT) || 10, max: parseFloat(process.env.MAX_RECHARGE_USDT) || 10000 }).withMessage('Invalid amount'),
-  body('payment_method').notEmpty().withMessage('Payment method is required'),
-  body('account_number').notEmpty().withMessage('Account number is required'),
-  body('account_name').notEmpty().withMessage('Account name is required')
+  body('amount_usdt').isFloat({ min: 1 }).withMessage('Invalid amount'),
+  body('payment_method').notEmpty().withMessage('Payment method required'),
+  body('account_number').notEmpty().withMessage('Account number required'),
+  body('account_name').notEmpty().withMessage('Account name required')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Validation failed',
-        errors: errors.array()
-      });
+      return res.status(400).json({ success: false, message: errors.array()[0].msg });
     }
 
-    const { amount_usdt, payment_method, account_number, account_name } = req.body;
+    const { amount_usdt, payment_method, account_number, account_name, payment_reference } = req.body;
     const userId = req.user.id;
-    const pkrRate = parseFloat(process.env.PKR_RATE) || 280;
+    const rate   = pkrRate();
 
-    // Create transaction record
     const result = await pool.query(
-      `INSERT INTO transactions (user_id, type, amount_usdt, amount_pkr, payment_method, status, notes)
-       VALUES ($1, 'recharge', $2, $3, $4, 'pending', $5)
-       RETURNING id`,
-      [userId, amount_usdt, (amount_usdt * pkrRate).toFixed(2), payment_method, `Bank transfer from ${account_name} (${account_number})`]
+      `INSERT INTO transactions
+         (user_id, type, amount_usdt, amount_pkr, payment_method, payment_reference, status, notes)
+       VALUES ($1, 'recharge', $2, $3, $4, $5, 'pending', $6)
+       RETURNING id, created_at`,
+      [userId, amount_usdt, (amount_usdt * rate).toFixed(2), payment_method,
+       payment_reference || null,
+       `Recharge from ${account_name} (${account_number})`]
     );
 
-    const transaction = result.rows[0];
+    // notify user
+    await pool.query(
+      `INSERT INTO notifications (user_id, title, message, type)
+       VALUES ($1, 'Recharge Submitted', $2, 'info')`,
+      [userId, `Your recharge of ${amount_usdt} USDT is under review.`]
+    );
 
     res.json({
       success: true,
-      message: 'Recharge request submitted. Please upload payment screenshot.',
+      message: 'Recharge request submitted. Upload payment screenshot to confirm.',
       data: {
-        transaction_id: transaction.id,
+        transaction_id: result.rows[0].id,
         amount_usdt,
-        amount_pkr: (amount_usdt * pkrRate).toFixed(2),
+        amount_pkr: (amount_usdt * rate).toFixed(2),
         status: 'pending',
-        payment_method,
-        notes: 'Upload screenshot to /api/wallet/recharge/:id/screenshot'
+        created_at: result.rows[0].created_at
       }
     });
   } catch (error) {
     console.error('Recharge error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to create recharge request'
-    });
+    res.status(500).json({ success: false, message: 'Failed to create recharge request' });
   }
 });
 
-// Upload recharge screenshot
+// ── POST /api/wallet/recharge/:id/screenshot ──────────────────────────────────
 router.post('/recharge/:id/screenshot', authenticate, uploadSingle('screenshot'), async (req, res) => {
   try {
     const transactionId = req.params.id;
     const userId = req.user.id;
 
     if (!req.file) {
-      return res.status(400).json({
-        success: false,
-        message: 'No file uploaded'
-      });
+      return res.status(400).json({ success: false, message: 'No file uploaded' });
     }
 
-    // Verify transaction belongs to user
+    // FIX: was using double-quote SQL string literal — now uses single quotes
     const txResult = await pool.query(
-      'SELECT * FROM transactions WHERE id = $1 AND user_id = $2 AND type = "recharge"',
+      `SELECT * FROM transactions WHERE id = $1 AND user_id = $2 AND type = 'recharge'`,
       [transactionId, userId]
     );
-
-    if (txResult.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Transaction not found'
-      });
+    if (!txResult.rows.length) {
+      return res.status(404).json({ success: false, message: 'Transaction not found' });
     }
 
-    // Update transaction with screenshot URL
     const screenshotUrl = `/uploads/${req.file.filename}`;
     await pool.query(
-      'UPDATE transactions SET screenshot_url = $1 WHERE id = $2',
+      `UPDATE transactions SET screenshot_url = $1 WHERE id = $2`,
       [screenshotUrl, transactionId]
     );
 
     res.json({
       success: true,
-      message: 'Screenshot uploaded successfully',
-      data: {
-        transaction_id: transactionId,
-        screenshot_url: screenshotUrl
-      }
+      message: 'Screenshot uploaded. Admin will review and credit your balance.',
+      data: { transaction_id: transactionId, screenshot_url: screenshotUrl }
     });
   } catch (error) {
     console.error('Upload screenshot error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to upload screenshot'
-    });
+    res.status(500).json({ success: false, message: 'Failed to upload screenshot' });
   }
 });
 
-// Withdraw (requires KYC)
+// ── POST /api/wallet/withdraw ─────────────────────────────────────────────────
 router.post('/withdraw', authenticate, requireKYC, [
-  body('amount_usdt').isFloat({ min: parseFloat(process.env.MIN_WITHDRAW_USDT) || 10, max: parseFloat(process.env.MAX_WITHDRAW_USDT) || 10000 }).withMessage('Invalid amount'),
-  body('payment_method').notEmpty().withMessage('Payment method is required'),
-  body('account_number').notEmpty().withMessage('Account number is required'),
-  body('account_name').notEmpty().withMessage('Account name is required')
+  body('amount_usdt').isFloat({ min: 1 }).withMessage('Invalid amount'),
+  body('payment_method').notEmpty().withMessage('Payment method required'),
+  body('account_number').notEmpty().withMessage('Account number required'),
+  body('account_name').notEmpty().withMessage('Account name required')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Validation failed',
-        errors: errors.array()
-      });
+      return res.status(400).json({ success: false, message: errors.array()[0].msg });
     }
 
     const { amount_usdt, payment_method, account_number, account_name } = req.body;
     const userId = req.user.id;
-    const pkrRate = parseFloat(process.env.PKR_RATE) || 280;
+    const rate   = pkrRate();
 
-    // Check balance
-    const balanceResult = await pool.query(
-      'SELECT balance_usdt FROM users WHERE id = $1',
-      [userId]
+    // get user VIP for min-withdraw check
+    const userResult = await pool.query(
+      'SELECT balance_usdt, vip_level FROM users WHERE id = $1', [userId]
     );
+    if (!userResult.rows.length) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    const { balance_usdt, vip_level } = userResult.rows[0];
 
-    if (balanceResult.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
+    const vipResult = await pool.query('SELECT min_withdraw_usdt FROM vip_levels WHERE level = $1', [vip_level || 0]);
+    const minWithdraw = vipResult.rows.length ? parseFloat(vipResult.rows[0].min_withdraw_usdt) : 10;
+
+    if (parseFloat(amount_usdt) < minWithdraw) {
+      return res.status(400).json({ success: false, message: `Minimum withdrawal is ${minWithdraw} USDT` });
+    }
+    if (parseFloat(amount_usdt) > parseFloat(balance_usdt)) {
+      return res.status(400).json({ success: false, message: 'Insufficient balance' });
     }
 
-    const balance = parseFloat(balanceResult.rows[0].balance_usdt);
-
-    if (amount_usdt > balance) {
-      return res.status(400).json({
-        success: false,
-        message: 'Insufficient balance'
-      });
-    }
-
-    // Freeze the amount
+    // deduct balance immediately (freeze until processed)
     await pool.query(
-      'UPDATE users SET balance_usdt = balance_usdt - $1 WHERE id = $2',
+      `UPDATE users
+       SET balance_usdt = balance_usdt - $1, frozen_usdt = frozen_usdt + $1
+       WHERE id = $2`,
       [amount_usdt, userId]
     );
 
-    // Create transaction record
     const result = await pool.query(
-      `INSERT INTO transactions (user_id, type, amount_usdt, amount_pkr, payment_method, status, notes)
+      `INSERT INTO transactions
+         (user_id, type, amount_usdt, amount_pkr, payment_method, status, notes)
        VALUES ($1, 'withdrawal', $2, $3, $4, 'pending', $5)
-       RETURNING id`,
-      [userId, amount_usdt, (amount_usdt * pkrRate).toFixed(2), payment_method, `Withdrawal to ${account_name} (${account_number})`]
+       RETURNING id, created_at`,
+      [userId, amount_usdt, (amount_usdt * rate).toFixed(2), payment_method,
+       `Withdrawal to ${account_name} (${account_number})`]
     );
 
-    const transaction = result.rows[0];
+    await pool.query(
+      `INSERT INTO notifications (user_id, title, message, type)
+       VALUES ($1, 'Withdrawal Requested', $2, 'info')`,
+      [userId, `Your withdrawal of ${amount_usdt} USDT is being processed.`]
+    );
 
     res.json({
       success: true,
-      message: 'Withdrawal request submitted. Admin will review and process.',
+      message: 'Withdrawal submitted. Admin will process within 24–48 hours.',
       data: {
-        transaction_id: transaction.id,
+        transaction_id: result.rows[0].id,
         amount_usdt,
-        amount_pkr: (amount_usdt * pkrRate).toFixed(2),
+        amount_pkr: (amount_usdt * rate).toFixed(2),
         status: 'pending',
-        payment_method,
-        estimated_completion: '24-48 hours'
+        estimated_completion: '24–48 hours'
       }
     });
   } catch (error) {
     console.error('Withdraw error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to create withdrawal request'
-    });
+    res.status(500).json({ success: false, message: 'Failed to create withdrawal request' });
   }
 });
 

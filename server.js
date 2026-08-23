@@ -5,78 +5,67 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
 
-// Import routes
-const authRoutes = require('./routes/auth');
-const userRoutes = require('./routes/user');
-const taskRoutes = require('./routes/tasks');
-const walletRoutes = require('./routes/wallet');
-const kycRoutes = require('./routes/kyc');
-
-// Initialize Express app
 const app = express();
 
-// Trust proxy for Railway/deployment
+// Trust proxy (Railway)
 app.set('trust proxy', 1);
 
-// Security middleware
+// Security
 app.use(helmet());
 
-// CORS configuration
-const corsOptions = {
+// CORS
+app.use(cors({
   origin: process.env.CORS_ORIGIN || '*',
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
-};
-app.use(cors(corsOptions));
+}));
 
-// Health check endpoint (before rate limiter for Railway)
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'ok',
-    message: 'RFT Entertainment API is running'
-  });
-});
+// Health (before rate limiter)
+app.get('/health', (req, res) => res.status(200).json({ status: 'ok', message: 'RFT Entertainment API is running' }));
 
 // Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  message: 'Too many requests from this IP, please try again later.'
-});
-app.use('/api/', limiter);
+app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 200 }));
 
-// Body parser middleware
+// Body parser
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Static files for uploads
+// Static uploads
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// API routes
-app.use('/api/auth', authRoutes);
-app.use('/api/user', userRoutes);
-app.use('/api/tasks', taskRoutes);
-app.use('/api/wallet', walletRoutes);
-app.use('/api/kyc', kycRoutes);
+// ── Routes ────────────────────────────────────────────────────────────────────
+app.use('/api/auth',          require('./routes/auth'));
+app.use('/api/user',          require('./routes/user'));
+app.use('/api/tasks',         require('./routes/tasks'));
+app.use('/api/wallet',        require('./routes/wallet'));
+app.use('/api/kyc',           require('./routes/kyc'));
+app.use('/api/vip',           require('./routes/vip'));
+app.use('/api/referral',      require('./routes/referral'));
+app.use('/api/notifications', require('./routes/notifications'));
+app.use('/api/admin',         require('./routes/admin'));
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    message: 'RFT Entertainment API is running',
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development'
-  });
-});
+// API health + public config
+app.get('/api/health', (req, res) => res.json({
+  status: 'ok',
+  timestamp: new Date().toISOString(),
+  environment: process.env.NODE_ENV || 'development'
+}));
 
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    message: 'Endpoint not found'
-  });
-});
+// Public app config (non-sensitive, read by frontend on load)
+app.get('/api/config', (req, res) => res.json({
+  success: true,
+  data: {
+    pkr_rate:          parseFloat(process.env.PKR_RATE) || 280,
+    support_whatsapp:  process.env.SUPPORT_WHATSAPP || '923XXXXXXXXX',
+    min_recharge_usdt: parseFloat(process.env.MIN_RECHARGE_USDT) || 10,
+    min_withdraw_usdt: parseFloat(process.env.MIN_WITHDRAW_USDT) || 10,
+    app_name:          'RFT Entertainment'
+  }
+}));
+
+// 404
+app.use((req, res) => res.status(404).json({ success: false, message: 'Endpoint not found' }));
 
 // Error handler
 app.use((err, req, res, next) => {
@@ -88,12 +77,10 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 RFT Entertainment API running on port ${PORT}`);
   console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🔗 API URL: http://localhost:${PORT}/api`);
 });
 
 module.exports = app;
