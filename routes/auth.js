@@ -142,7 +142,7 @@ router.post('/register', [
     });
   } catch (error) {
     console.error('Register error:', error);
-    res.status(500).json({ success: false, message: 'Registration failed' });
+    res.status(500).json({ success: false, message: 'Registration failed', error: error.message, detail: error.detail || null });
   }
 });
 

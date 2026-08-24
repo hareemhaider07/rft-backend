@@ -190,7 +190,7 @@ router.get('/dashboard', adminAuth, async (req, res) => {
     });
   } catch (err) {
     console.error('Dashboard error:', err);
-    res.status(500).json({ success: false, message: 'Failed to fetch dashboard' });
+    res.status(500).json({ success: false, message: 'Failed to fetch dashboard', error: err.message });
   }
 });
 

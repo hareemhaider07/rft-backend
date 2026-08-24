@@ -52,7 +52,7 @@ const sec = (m) => console.log('\n--- ' + m + ' ---');
     phone: '031' + stamp.toString().slice(-8),
     password: 'Test1234'
   });
-  if (!reg.success) { err('Register: ' + reg.message); }
+  if (!reg.success) { err('Register: ' + reg.message + (reg.error ? ' | ERROR: ' + reg.error : '')); }
   else {
     ok('Registered: ' + reg.data.user.email);
     ok('Referral code: ' + reg.data.user.referral_code);
