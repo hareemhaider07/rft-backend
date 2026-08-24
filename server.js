@@ -66,7 +66,6 @@ app.use('/api/kyc',           require('./routes/kyc'));
 app.use('/api/vip',           require('./routes/vip'));
 app.use('/api/referral',      require('./routes/referral'));
 app.use('/api/notifications', require('./routes/notifications'));
-app.use('/api/lucky',         require('./routes/lucky'));
 app.use('/api/admin',         require('./routes/admin'));
 
 // API health + public config
@@ -106,5 +105,16 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 RFT Entertainment API running on port ${PORT}`);
   console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
+
+// Keep Supabase DB awake — ping every 4 minutes
+// Supabase free tier pauses after inactivity; this prevents it
+const pool = require('./config/database');
+setInterval(async () => {
+  try {
+    await pool.query('SELECT 1');
+  } catch (e) {
+    console.error('DB keepalive failed:', e.message);
+  }
+}, 4 * 60 * 1000);
 
 module.exports = app;
