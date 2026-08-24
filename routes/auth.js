@@ -113,10 +113,10 @@ router.post('/register', [
     const result = await pool.query(
       `INSERT INTO users (name, email, phone, password_hash, referral_code, referred_by)
        VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, name, email, phone, referral_code, balance_usdt, points, kyc_status, vip_level`,
+       RETURNING id, name, email, phone, referral_code, balance_usdt, points, kyc_status`,
       [name, email.toLowerCase(), phone, password_hash, userReferralCode, referral_code || null]
     );
-    const user = result.rows[0];
+    const user = { ...result.rows[0], vip_level: 0 };
 
     // build 3-level referral chain + credit registration bonus
     if (referral_code) await buildReferralChain(user.id, referral_code);
@@ -191,7 +191,7 @@ router.post('/login', [
         user: {
           id: user.id, name: user.name, email: user.email, phone: user.phone,
           referral_code: user.referral_code, balance_usdt: user.balance_usdt,
-          points: user.points, kyc_status: user.kyc_status, vip_level: user.vip_level
+          points: user.points, kyc_status: user.kyc_status, vip_level: user.vip_level || 0
         },
         ...tokens
       }

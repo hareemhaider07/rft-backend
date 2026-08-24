@@ -146,27 +146,29 @@ router.post('/auth/login', async (req, res) => {
 router.get('/dashboard', adminAuth, async (req, res) => {
   try {
     const pkrRate = parseFloat(process.env.PKR_RATE) || 280;
-    const [
-      users, pendingDep, pendingWit, pendingKyc,
-      totDep, totWit, todayTasks, activeUsers
-    ] = await Promise.all([
-      pool.query('SELECT COUNT(*) AS cnt FROM users'),
-      pool.query(`SELECT COUNT(*) AS cnt FROM transactions WHERE type='recharge'   AND status='pending'`),
-      pool.query(`SELECT COUNT(*) AS cnt FROM transactions WHERE type='withdrawal' AND status='pending'`),
-      pool.query(`SELECT COUNT(*) AS cnt FROM kyc_documents WHERE verification_status='pending'`),
-      pool.query(`SELECT COALESCE(SUM(amount_usdt),0) AS t FROM transactions WHERE type='recharge'   AND status='completed'`),
-      pool.query(`SELECT COALESCE(SUM(amount_usdt),0) AS t FROM transactions WHERE type='withdrawal' AND status='completed'`),
-      pool.query(`SELECT COALESCE(SUM(reward_usdt),0) AS t FROM daily_task_tracking WHERE task_date=CURRENT_DATE AND status='completed'`),
-      pool.query(`SELECT COUNT(*) AS cnt FROM users WHERE last_login_at > NOW() - INTERVAL '7 days'`)
+
+    // Run each query separately so one missing table doesn't kill the whole dashboard
+    const safe = async (query, fallback) => {
+      try { const r = await pool.query(query); return r; }
+      catch (e) { console.error('Dashboard query failed:', e.message); return { rows: [fallback] }; }
+    };
+
+    const [users, pendingDep, pendingWit, pendingKyc, totDep, totWit, todayTasks, activeUsers] = await Promise.all([
+      safe(`SELECT COUNT(*) AS cnt FROM users`, { cnt: 0 }),
+      safe(`SELECT COUNT(*) AS cnt FROM transactions WHERE type='recharge'   AND status='pending'`, { cnt: 0 }),
+      safe(`SELECT COUNT(*) AS cnt FROM transactions WHERE type='withdrawal' AND status='pending'`, { cnt: 0 }),
+      safe(`SELECT COUNT(*) AS cnt FROM kyc_documents WHERE verification_status='pending'`, { cnt: 0 }),
+      safe(`SELECT COALESCE(SUM(amount_usdt),0) AS t FROM transactions WHERE type='recharge'   AND status='completed'`, { t: 0 }),
+      safe(`SELECT COALESCE(SUM(amount_usdt),0) AS t FROM transactions WHERE type='withdrawal' AND status='completed'`, { t: 0 }),
+      safe(`SELECT COALESCE(SUM(reward_usdt),0) AS t FROM daily_task_tracking WHERE task_date=CURRENT_DATE AND status='completed'`, { t: 0 }),
+      safe(`SELECT COUNT(*) AS cnt FROM users WHERE last_login_at > NOW() - INTERVAL '7 days'`, { cnt: 0 })
     ]);
 
-    const vipDist = await pool.query(
-      `SELECT vip_level, COUNT(*) AS cnt FROM users GROUP BY vip_level ORDER BY vip_level`
-    );
-    const recentTx = await pool.query(
+    const vipDist = await safe(`SELECT vip_level, COUNT(*) AS cnt FROM users GROUP BY vip_level ORDER BY vip_level`, {});
+    const recentTx = await safe(
       `SELECT t.id,t.type,t.amount_usdt,t.status,t.created_at,u.name,u.phone
        FROM transactions t JOIN users u ON u.id=t.user_id
-       ORDER BY t.created_at DESC LIMIT 10`
+       ORDER BY t.created_at DESC LIMIT 10`, {}
     );
 
     res.json({
