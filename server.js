@@ -87,6 +87,26 @@ app.get('/api/config', (req, res) => res.json({
   }
 }));
 
+// Debug endpoint — test DB directly (remove after fixing)
+app.get('/api/debug-db', async (req, res) => {
+  const pool = require('./config/database');
+  const results = {};
+  const test = async (name, query) => {
+    try {
+      const r = await pool.query(query);
+      results[name] = { ok: true, rows: r.rows.length, sample: r.rows[0] };
+    } catch (e) {
+      results[name] = { ok: false, error: e.message };
+    }
+  };
+  await test('users_count',   'SELECT COUNT(*) FROM users');
+  await test('users_cols',    "SELECT column_name FROM information_schema.columns WHERE table_name='users' AND column_name IN ('id','email','phone','password_hash','referral_code','vip_level','balance_usdt','kyc_status') ORDER BY column_name");
+  await test('users_insert_test', "SELECT 1 FROM users WHERE email='__probe__@test.com'");
+  await test('refresh_tokens_exists', 'SELECT COUNT(*) FROM refresh_tokens');
+  await test('notifications_exists',  'SELECT COUNT(*) FROM notifications');
+  res.json({ success: true, results });
+});
+
 // 404
 app.use((req, res) => res.status(404).json({ success: false, message: 'Endpoint not found' }));
 
