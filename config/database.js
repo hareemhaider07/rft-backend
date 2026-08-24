@@ -1,18 +1,16 @@
 const { Pool } = require('pg');
 
-// Force IPv4 by disabling IPv6 lookup
-// Railway does not support IPv6 connections to external services
-const connectionString = process.env.DATABASE_URL;
+// Use SESSION POOLER URL from Supabase for IPv4 compatibility with Railway
+// Set DATABASE_URL in Railway to the Session Pooler connection string from:
+// Supabase → Connect → Session pooler
+// Format: postgresql://postgres.[project-ref]:[password]@aws-0-[region].pooler.supabase.com:5432/postgres
 
 const pool = new Pool({
-  connectionString,
+  connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  // Force IPv4 family
-  family: 4,
-  // Connection pool settings
   max: 10,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
+  connectionTimeoutMillis: 15000,
 });
 
 pool.on('connect', () => {
