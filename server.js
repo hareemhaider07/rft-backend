@@ -66,6 +66,7 @@ app.use('/api/kyc',           require('./routes/kyc'));
 app.use('/api/vip',           require('./routes/vip'));
 app.use('/api/referral',      require('./routes/referral'));
 app.use('/api/notifications', require('./routes/notifications'));
+app.use('/api/lucky',         require('./routes/lucky'));
 app.use('/api/admin',         require('./routes/admin'));
 
 // API health + public config
