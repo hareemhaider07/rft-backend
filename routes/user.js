@@ -111,6 +111,120 @@ router.get('/stats', authenticate, async (req, res) => {
   }
 });
 
+// GET /api/user/earnings-chart?period=7|30|90
+// Returns daily breakdown for the chart
+router.get('/earnings-chart', authenticate, async (req, res) => {
+  try {
+    const userId  = req.user.id;
+    const period  = Math.min(parseInt(req.query.period) || 30, 90);
+    const pkrRate = parseFloat(process.env.PKR_RATE) || 280;
+
+    // Daily task earnings
+    const taskRows = await pool.query(
+      `SELECT task_date::text AS date,
+              COALESCE(SUM(reward_usdt), 0) AS amount
+       FROM daily_task_tracking
+       WHERE user_id = $1
+         AND status = 'completed'
+         AND task_date >= CURRENT_DATE - INTERVAL '1 day' * $2
+       GROUP BY task_date
+       ORDER BY task_date ASC`,
+      [userId, period]
+    );
+
+    // Daily referral + spin earnings from transactions
+    const txRows = await pool.query(
+      `SELECT DATE(created_at)::text AS date,
+              type,
+              COALESCE(SUM(amount_usdt), 0) AS amount
+       FROM transactions
+       WHERE user_id = $1
+         AND status = 'completed'
+         AND type IN ('referral_commission', 'referral_bonus', 'spin_reward')
+         AND created_at >= CURRENT_DATE - INTERVAL '1 day' * $2
+       GROUP BY DATE(created_at), type
+       ORDER BY DATE(created_at) ASC`,
+      [userId, period]
+    );
+
+    // Build a map of all dates in the range
+    const dateMap = {};
+    for (let i = period - 1; i >= 0; i--) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const key = d.toISOString().split('T')[0];
+      dateMap[key] = { date: key, tasks: 0, referral: 0, spin: 0, total: 0 };
+    }
+
+    // Fill task earnings
+    for (const r of taskRows.rows) {
+      if (dateMap[r.date]) {
+        dateMap[r.date].tasks = parseFloat(r.amount);
+      }
+    }
+
+    // Fill other earnings
+    for (const r of txRows.rows) {
+      if (!dateMap[r.date]) continue;
+      const amt = parseFloat(r.amount);
+      if (r.type === 'referral_commission' || r.type === 'referral_bonus') {
+        dateMap[r.date].referral += amt;
+      } else if (r.type === 'spin_reward') {
+        dateMap[r.date].spin += amt;
+      }
+    }
+
+    // Calculate totals and build array
+    const days = Object.values(dateMap).map(d => {
+      d.tasks    = parseFloat(d.tasks.toFixed(4));
+      d.referral = parseFloat(d.referral.toFixed(4));
+      d.spin     = parseFloat(d.spin.toFixed(4));
+      d.total    = parseFloat((d.tasks + d.referral + d.spin).toFixed(4));
+      return d;
+    });
+
+    // Summary stats
+    const totalTasks    = days.reduce((s, d) => s + d.tasks,    0);
+    const totalReferral = days.reduce((s, d) => s + d.referral, 0);
+    const totalSpin     = days.reduce((s, d) => s + d.spin,     0);
+    const totalAll      = totalTasks + totalReferral + totalSpin;
+    const maxDay        = Math.max(...days.map(d => d.total), 0.001);
+
+    // Streak: consecutive days with earnings
+    let streak = 0;
+    for (let i = days.length - 1; i >= 0; i--) {
+      if (days[i].total > 0) streak++;
+      else break;
+    }
+
+    // Best day
+    const bestDay = days.reduce((best, d) => d.total > (best?.total || 0) ? d : best, null);
+
+    res.json({
+      success: true,
+      data: {
+        period,
+        days,
+        summary: {
+          total_usdt:          parseFloat(totalAll.toFixed(4)),
+          total_pkr:           (totalAll * pkrRate).toFixed(0),
+          total_tasks_usdt:    parseFloat(totalTasks.toFixed(4)),
+          total_referral_usdt: parseFloat(totalReferral.toFixed(4)),
+          total_spin_usdt:     parseFloat(totalSpin.toFixed(4)),
+          earning_streak:      streak,
+          best_day_usdt:       bestDay ? parseFloat(bestDay.total.toFixed(4)) : 0,
+          best_day_date:       bestDay?.date || null,
+          active_days:         days.filter(d => d.total > 0).length,
+          max_day_value:       parseFloat(maxDay.toFixed(4))
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Earnings chart error:', error);
+    res.status(500).json({ success: false, message: 'Failed to load earnings chart', error: error.message });
+  }
+});
+
 // GET /api/user/leaderboard?type=weekly|referrals|tasks|spin&limit=20
 router.get('/leaderboard', authenticate, async (req, res) => {
   try {
