@@ -68,6 +68,7 @@ app.use('/api/referral',      require('./routes/referral'));
 app.use('/api/notifications', require('./routes/notifications'));
 app.use('/api/spin',          require('./routes/spin'));
 app.use('/api/admin',         require('./routes/admin'));
+// v2.0 — all routes confirmed mounted
 
 // API health + public config
 app.get('/api/health', (req, res) => res.json({
