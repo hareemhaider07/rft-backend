@@ -69,6 +69,20 @@ app.use('/api/notifications', require('./routes/notifications'));
 app.use('/api/spin',          require('./routes/spin'));
 app.use('/api/admin',         require('./routes/admin'));
 // v2.0 — all routes confirmed mounted
+app.get('/api/version', (req, res) => {
+  res.json({
+    version: '2.0',
+    routes: [
+      '/api/spin',
+      '/api/notifications/poll',
+      '/api/user/earnings-chart',
+      '/api/user/leaderboard'
+    ],
+    spin_file_exists: (() => { try { require('./routes/spin'); return true; } catch(e) { return e.message; } })(),
+    notifications_poll: (() => { try { const r = require('./routes/notifications'); return typeof r === 'function' ? 'loaded' : 'loaded'; } catch(e) { return e.message; } })(),
+    user_earnings: (() => { try { require('./routes/user'); return true; } catch(e) { return e.message; } })()
+  });
+});
 
 // API health + public config
 app.get('/api/health', (req, res) => res.json({
