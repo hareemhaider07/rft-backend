@@ -251,8 +251,6 @@ router.post('/refresh', async (req, res) => {
 });
 
 // ── POST /api/auth/forgot-password ───────────────────────────────────────────
-// Generates a 6-digit OTP stored in DB, returns it in response
-// (In production wire this to SMS/email; for now admin can read it from DB)
 router.post('/forgot-password', [
   body('email_or_phone').notEmpty().withMessage('Email or phone required')
 ], async (req, res) => {
@@ -263,18 +261,22 @@ router.post('/forgot-password', [
     }
     const { email_or_phone } = req.body;
     const r = await pool.query(
-      'SELECT id, email, phone FROM users WHERE email=$1 OR phone=$2',
+      'SELECT id, name, email, phone FROM users WHERE email=$1 OR phone=$2',
       [email_or_phone.toLowerCase(), email_or_phone]
     );
     // Always return success to prevent user enumeration
     if (!r.rows.length) {
-      return res.json({ success: true, message: 'If an account exists, a reset code has been sent.' });
+      return res.json({
+        success: true,
+        message: 'If an account exists, a reset code has been sent.',
+        delivery: 'none'
+      });
     }
     const user = r.rows[0];
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp       = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
 
-    // Store OTP in password_resets table (create if not exists via upsert pattern)
+    // Store OTP
     await pool.query(
       `INSERT INTO password_resets (user_id, otp, expires_at)
        VALUES ($1, $2, $3)
@@ -282,17 +284,55 @@ router.post('/forgot-password', [
       [user.id, otp, expiresAt]
     );
 
-    // In production: send OTP via SMS/email here
-    // For now we include it in dev response only
+    // Attempt delivery — try email first, then SMS
+    const { sendOtpEmail } = require('../services/mailer');
+    const { sendOtpSms }   = require('../services/sms');
+
+    let delivery    = 'none';
+    let deliveredTo = null;
+
+    // Try email if user has one and RESEND is configured
+    if (user.email && process.env.RESEND_API_KEY) {
+      const result = await sendOtpEmail(user.email, otp, user.name);
+      if (result.sent) {
+        delivery    = 'email';
+        deliveredTo = user.email.replace(/(.{2})(.*)(@.*)/, '$1***$3');
+      }
+    }
+
+    // Try SMS if email failed/unavailable and Twilio is configured
+    if (delivery === 'none' && user.phone && process.env.TWILIO_ACCOUNT_SID) {
+      const result = await sendOtpSms(user.phone, otp);
+      if (result.sent) {
+        delivery    = 'sms';
+        deliveredTo = user.phone.slice(0, 4) + '****' + user.phone.slice(-2);
+      }
+    }
+
+    // Fallback: OTP stored in DB, admin can retrieve it
     const isDev = process.env.NODE_ENV !== 'production';
-    res.json({
-      success: true,
-      message: 'Reset code generated. Contact admin or check SMS.',
-      ...(isDev && { debug_otp: otp, debug_note: 'OTP shown in dev mode only' })
-    });
+    const response = {
+      success:     true,
+      delivery,
+      delivered_to: deliveredTo,
+      message: delivery === 'email'
+        ? `Reset code sent to your email ${deliveredTo}`
+        : delivery === 'sms'
+        ? `Reset code sent to ${deliveredTo} via SMS`
+        : 'Reset code generated. If delivery failed, contact admin.',
+      expires_in_minutes: 15
+    };
+
+    // Only expose OTP in dev mode as a safety net
+    if (isDev && delivery === 'none') {
+      response.debug_otp  = otp;
+      response.debug_note = 'OTP visible because no delivery service is configured';
+    }
+
+    res.json(response);
   } catch (error) {
     console.error('Forgot password error:', error);
-    res.status(500).json({ success: false, message: 'Failed to process request' });
+    res.status(500).json({ success: false, message: 'Failed to process request', error: error.message });
   }
 });
 
