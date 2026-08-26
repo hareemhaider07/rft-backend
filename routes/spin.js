@@ -1,6 +1,7 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticate } = require('../middleware/auth');
+// v2.0 — spin wheel with prizes, history, stats
 
 const router = express.Router();
 

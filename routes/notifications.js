@@ -1,6 +1,7 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticate } = require('../middleware/auth');
+// v2.0 — includes /poll endpoint
 
 const router = express.Router();
 

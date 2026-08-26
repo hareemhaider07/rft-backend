@@ -2,6 +2,7 @@ const express = require('express');
 const { body, validationResult } = require('express-validator');
 const pool = require('../config/database');
 const { authenticate } = require('../middleware/auth');
+// v2.0 — includes /earnings-chart and /leaderboard endpoints
 
 const router = express.Router();
 
