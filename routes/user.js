@@ -111,37 +111,155 @@ router.get('/stats', authenticate, async (req, res) => {
   }
 });
 
-// GET /api/user/leaderboard  — top earners this week (real data)
+// GET /api/user/leaderboard?type=weekly|referrals|tasks|spin&limit=20
 router.get('/leaderboard', authenticate, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT u.name, u.referral_code, u.vip_level,
-              COALESCE(SUM(d.reward_usdt), 0) AS week_earned
-       FROM daily_task_tracking d
-       JOIN users u ON u.id = d.user_id
-       WHERE d.task_date >= CURRENT_DATE - INTERVAL '7 days'
-         AND d.status = 'completed'
-         AND u.is_active = true
-       GROUP BY u.id, u.name, u.referral_code, u.vip_level
-       ORDER BY week_earned DESC
-       LIMIT 10`
-    );
-
+    const type    = req.query.type || 'weekly';
+    const limit   = Math.min(parseInt(req.query.limit) || 20, 50);
     const pkrRate = parseFloat(process.env.PKR_RATE) || 280;
-    const leaders = result.rows.map((r, i) => ({
-      rank:         i + 1,
-      display_name: r.name
-        ? r.name.split(' ')[0].charAt(0) + '***' + (r.name.split(' ')[0].slice(-1) || '')
-        : '•••' + (r.referral_code || '').slice(-3),
-      vip_level:    r.vip_level || 0,
-      week_earned:  parseFloat(r.week_earned).toFixed(2),
-      week_earned_pkr: (r.week_earned * pkrRate).toFixed(0)
-    }));
 
-    res.json({ success: true, data: leaders });
+    const maskName = (name, code) => {
+      if (!name) return '•••' + (code || '').slice(-3);
+      const first = name.split(' ')[0];
+      if (first.length <= 2) return first.charAt(0) + '***';
+      return first.charAt(0) + '•'.repeat(Math.min(first.length - 2, 4)) + first.slice(-1);
+    };
+
+    let rows = [];
+
+    if (type === 'weekly') {
+      // Top earners this week (task rewards)
+      const r = await pool.query(
+        `SELECT u.name, u.referral_code, u.vip_level,
+                COALESCE(SUM(d.reward_usdt), 0) AS score
+         FROM daily_task_tracking d
+         JOIN users u ON u.id = d.user_id
+         WHERE d.task_date >= CURRENT_DATE - INTERVAL '7 days'
+           AND d.status = 'completed' AND u.is_active = true
+         GROUP BY u.id, u.name, u.referral_code, u.vip_level
+         ORDER BY score DESC LIMIT $1`,
+        [limit]
+      );
+      rows = r.rows.map((r, i) => ({
+        rank: i + 1,
+        display_name: maskName(r.name, r.referral_code),
+        vip_level: r.vip_level || 0,
+        score: parseFloat(r.score).toFixed(2),
+        score_label: parseFloat(r.score).toFixed(2) + ' USDT',
+        score_pkr: (r.score * pkrRate).toFixed(0)
+      }));
+
+    } else if (type === 'monthly') {
+      // Top earners this month
+      const r = await pool.query(
+        `SELECT u.name, u.referral_code, u.vip_level,
+                COALESCE(SUM(d.reward_usdt), 0) AS score
+         FROM daily_task_tracking d
+         JOIN users u ON u.id = d.user_id
+         WHERE d.task_date >= DATE_TRUNC('month', CURRENT_DATE)
+           AND d.status = 'completed' AND u.is_active = true
+         GROUP BY u.id, u.name, u.referral_code, u.vip_level
+         ORDER BY score DESC LIMIT $1`,
+        [limit]
+      );
+      rows = r.rows.map((r, i) => ({
+        rank: i + 1,
+        display_name: maskName(r.name, r.referral_code),
+        vip_level: r.vip_level || 0,
+        score: parseFloat(r.score).toFixed(2),
+        score_label: parseFloat(r.score).toFixed(2) + ' USDT',
+        score_pkr: (r.score * pkrRate).toFixed(0)
+      }));
+
+    } else if (type === 'tasks') {
+      // Most tasks completed all time
+      const r = await pool.query(
+        `SELECT u.name, u.referral_code, u.vip_level,
+                COUNT(*) AS score
+         FROM daily_task_tracking d
+         JOIN users u ON u.id = d.user_id
+         WHERE d.status = 'completed' AND u.is_active = true
+         GROUP BY u.id, u.name, u.referral_code, u.vip_level
+         ORDER BY score DESC LIMIT $1`,
+        [limit]
+      );
+      rows = r.rows.map((r, i) => ({
+        rank: i + 1,
+        display_name: maskName(r.name, r.referral_code),
+        vip_level: r.vip_level || 0,
+        score: parseInt(r.score),
+        score_label: parseInt(r.score) + ' tasks',
+        score_pkr: null
+      }));
+
+    } else if (type === 'referrals') {
+      // Most referrals
+      const r = await pool.query(
+        `SELECT u.name, u.referral_code, u.vip_level,
+                COUNT(ref.referred_id) AS score
+         FROM users u
+         LEFT JOIN referrals ref ON ref.referrer_id = u.id AND ref.referral_level = 1
+         WHERE u.is_active = true
+         GROUP BY u.id, u.name, u.referral_code, u.vip_level
+         HAVING COUNT(ref.referred_id) > 0
+         ORDER BY score DESC LIMIT $1`,
+        [limit]
+      );
+      rows = r.rows.map((r, i) => ({
+        rank: i + 1,
+        display_name: maskName(r.name, r.referral_code),
+        vip_level: r.vip_level || 0,
+        score: parseInt(r.score),
+        score_label: parseInt(r.score) + ' referrals',
+        score_pkr: null
+      }));
+
+    } else if (type === 'spin') {
+      // Biggest spin winners
+      const r = await pool.query(
+        `SELECT u.name, u.referral_code, u.vip_level,
+                COALESCE(SUM(sh.prize_value), 0) AS score,
+                COUNT(*) AS spin_count
+         FROM spin_history sh
+         JOIN users u ON u.id = sh.user_id
+         WHERE sh.prize_type = 'usdt' AND u.is_active = true
+         GROUP BY u.id, u.name, u.referral_code, u.vip_level
+         ORDER BY score DESC LIMIT $1`,
+        [limit]
+      );
+      rows = r.rows.map((r, i) => ({
+        rank: i + 1,
+        display_name: maskName(r.name, r.referral_code),
+        vip_level: r.vip_level || 0,
+        score: parseFloat(r.score).toFixed(2),
+        score_label: parseFloat(r.score).toFixed(2) + ' USDT won',
+        score_pkr: (r.score * pkrRate).toFixed(0),
+        spin_count: parseInt(r.spin_count)
+      }));
+    }
+
+    // Find current user's rank
+    let myRank = null;
+    try {
+      const userId = req.user.id;
+      const myName = (await pool.query('SELECT name, referral_code FROM users WHERE id=$1', [userId])).rows[0];
+      const myMasked = maskName(myName?.name, myName?.referral_code);
+      const idx = rows.findIndex(r => r.display_name === myMasked);
+      if (idx !== -1) myRank = idx + 1;
+    } catch (_) {}
+
+    res.json({
+      success: true,
+      data: {
+        type,
+        leaders: rows,
+        my_rank: myRank,
+        generated_at: new Date().toISOString()
+      }
+    });
   } catch (error) {
     console.error('Leaderboard error:', error);
-    res.status(500).json({ success: false, message: 'Failed to fetch leaderboard' });
+    res.status(500).json({ success: false, message: 'Failed to fetch leaderboard', error: error.message });
   }
 });
 
