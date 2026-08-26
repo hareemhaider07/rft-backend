@@ -184,7 +184,16 @@ router.post('/recharge/:id/screenshot', authenticate, uploadSingle('screenshot')
       return res.status(404).json({ success: false, message: 'Transaction not found' });
     }
 
-    const screenshotUrl = `/uploads/${req.file.filename}`;
+    // Upload to Supabase Storage — falls back to local if not configured
+    const { uploadFile } = require('../services/storage');
+    const cloudUrl = await uploadFile(
+      req.file.path || req.file.buffer,
+      'recharge',
+      req.file.originalname,
+      req.file.mimetype
+    );
+    const screenshotUrl = cloudUrl || `/uploads/${req.file.filename}`;
+
     await pool.query(
       `UPDATE transactions SET screenshot_url = $1 WHERE id = $2`,
       [screenshotUrl, transactionId]
