@@ -712,3 +712,106 @@ router.post('/notify', adminAuth, async (req, res) => {
 });
 
 module.exports = router;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SPIN WHEEL ADMIN ROUTES
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/admin/spin/prizes?vip=0
+router.get('/spin/prizes', adminAuth, async (req, res) => {
+  try {
+    const vip = req.query.vip !== undefined ? parseInt(req.query.vip) : null;
+    let query = 'SELECT * FROM spin_prizes';
+    const params = [];
+    if (vip !== null) { query += ' WHERE min_vip_level = $1'; params.push(vip); }
+    query += ' ORDER BY min_vip_level ASC, display_order ASC';
+    const r = await pool.query(query, params);
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to fetch prizes', error: err.message });
+  }
+});
+
+// POST /api/admin/spin/prizes
+router.post('/spin/prizes', adminAuth, async (req, res) => {
+  try {
+    const { name, prize_type, prize_value, color, probability, min_vip_level, display_order, is_active } = req.body;
+    if (!name || !prize_type || probability === undefined) {
+      return res.status(400).json({ success: false, message: 'name, prize_type, probability required' });
+    }
+    const r = await pool.query(
+      `INSERT INTO spin_prizes (name, prize_type, prize_value, color, probability, min_vip_level, display_order, is_active)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [name, prize_type, prize_value || 0, color || '#888888', probability,
+       min_vip_level || 0, display_order || 0, is_active !== false]
+    );
+    res.status(201).json({ success: true, data: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to create prize', error: err.message });
+  }
+});
+
+// PUT /api/admin/spin/prizes/:id
+router.put('/spin/prizes/:id', adminAuth, async (req, res) => {
+  try {
+    const { name, prize_type, prize_value, color, probability, min_vip_level, display_order, is_active } = req.body;
+    const r = await pool.query(
+      `UPDATE spin_prizes SET
+         name          = COALESCE($1, name),
+         prize_type    = COALESCE($2, prize_type),
+         prize_value   = COALESCE($3, prize_value),
+         color         = COALESCE($4, color),
+         probability   = COALESCE($5, probability),
+         min_vip_level = COALESCE($6, min_vip_level),
+         display_order = COALESCE($7, display_order),
+         is_active     = COALESCE($8, is_active)
+       WHERE id = $9 RETURNING *`,
+      [name, prize_type, prize_value, color, probability, min_vip_level, display_order, is_active, req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ success: false, message: 'Prize not found' });
+    res.json({ success: true, data: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to update prize', error: err.message });
+  }
+});
+
+// GET /api/admin/spin/history — recent spins across all users
+router.get('/spin/history', adminAuth, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const r = await pool.query(
+      `SELECT sh.*, u.name AS user_name, u.phone AS user_phone
+       FROM spin_history sh
+       JOIN users u ON u.id = sh.user_id
+       ORDER BY sh.created_at DESC LIMIT $1`,
+      [limit]
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to fetch spin history', error: err.message });
+  }
+});
+
+// GET /api/admin/spin/stats — today's spin statistics
+router.get('/spin/stats', adminAuth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT
+         COUNT(*)                                                          AS total_spins_today,
+         COALESCE(SUM(CASE WHEN prize_type='usdt'   THEN prize_value ELSE 0 END), 0) AS usdt_paid_today,
+         COALESCE(SUM(CASE WHEN prize_type='points' THEN prize_value ELSE 0 END), 0) AS points_paid_today
+       FROM spin_history WHERE spin_date = CURRENT_DATE`
+    );
+    const s = r.rows[0];
+    res.json({
+      success: true,
+      data: {
+        total_spins_today:  parseInt(s.total_spins_today),
+        usdt_paid_today:    parseFloat(s.usdt_paid_today).toFixed(4),
+        points_paid_today:  parseInt(s.points_paid_today)
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to fetch spin stats', error: err.message });
+  }
+});
