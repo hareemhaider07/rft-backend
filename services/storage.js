@@ -18,6 +18,7 @@ const path = require('path');
 const fs   = require('fs');
 
 const SUPABASE_URL    = process.env.SUPABASE_URL;
+// Supports both sb_publishable_ (new format) and eyJ... (JWT format) anon keys
 const SUPABASE_ANON   = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_KEY;
 const BUCKET          = 'rft-uploads';
 const STORAGE_BASE    = `${SUPABASE_URL}/storage/v1/object`;

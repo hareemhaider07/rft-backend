@@ -84,7 +84,8 @@ app.get('/api/config', (req, res) => res.json({
     support_whatsapp:  process.env.SUPPORT_WHATSAPP || '923XXXXXXXXX',
     min_recharge_usdt: parseFloat(process.env.MIN_RECHARGE_USDT) || 10,
     min_withdraw_usdt: parseFloat(process.env.MIN_WITHDRAW_USDT) || 10,
-    app_name:          'RFT Entertainment'
+    app_name:          'RFT Entertainment',
+    storage_enabled:   !!(process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY)
   }
 }));
 
