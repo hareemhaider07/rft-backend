@@ -63,13 +63,15 @@ router.post('/submit', authenticate, uploadFields([
     const { document_type, issuing_country, document_number } = req.body;
     const userId = req.user.id;
 
-    // Check if already pending
+    // Check if already pending — block double submission
+    // Allow resubmission if previously rejected
     const existing = await pool.query(
-      `SELECT id FROM kyc_documents
-       WHERE user_id = $1 AND verification_status = 'pending'`,
+      `SELECT id, verification_status FROM kyc_documents
+       WHERE user_id = $1
+       ORDER BY submitted_at DESC LIMIT 1`,
       [userId]
     );
-    if (existing.rows.length) {
+    if (existing.rows.length && existing.rows[0].verification_status === 'pending') {
       return res.status(400).json({
         success: false,
         message: 'KYC documents already submitted and pending review'
