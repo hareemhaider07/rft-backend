@@ -815,3 +815,50 @@ router.get('/spin/stats', adminAuth, async (req, res) => {
     res.status(500).json({ success: false, message: 'Failed to fetch spin stats', error: err.message });
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LOGIN POPUPS ADMIN ROUTES
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.get('/login-popups', adminAuth, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM login_popups ORDER BY created_at DESC');
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    res.json({ success: true, data: [] }); // table may not exist yet
+  }
+});
+
+router.post('/login-popups', adminAuth, async (req, res) => {
+  try {
+    const { title, content, image_url, button_text, button_url, show_once, expires_at } = req.body;
+    if (!title || !content) return res.status(400).json({ success: false, message: 'title and content required' });
+    // Deactivate existing popups first
+    await pool.query(`UPDATE login_popups SET is_active = false`);
+    const r = await pool.query(
+      `INSERT INTO login_popups (title, content, image_url, button_text, button_url, show_once, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [title, content, image_url||null, button_text||'Got it', button_url||null, show_once||false, expires_at||null]
+    );
+    res.status(201).json({ success: true, data: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to create popup', error: err.message });
+  }
+});
+
+router.put('/login-popups/:id', adminAuth, async (req, res) => {
+  try {
+    const { title, content, image_url, button_text, button_url, is_active } = req.body;
+    const r = await pool.query(
+      `UPDATE login_popups SET
+         title=COALESCE($1,title), content=COALESCE($2,content),
+         image_url=COALESCE($3,image_url), button_text=COALESCE($4,button_text),
+         button_url=COALESCE($5,button_url), is_active=COALESCE($6,is_active)
+       WHERE id=$7 RETURNING *`,
+      [title, content, image_url, button_text, button_url, is_active, req.params.id]
+    );
+    res.json({ success: true, data: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to update popup' });
+  }
+});

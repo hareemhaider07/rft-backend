@@ -379,3 +379,110 @@ router.get('/leaderboard', authenticate, async (req, res) => {
 });
 
 module.exports = router;
+
+// GET /api/user/my-tasks — completed task history
+router.get('/my-tasks', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const page   = parseInt(req.query.page)  || 1;
+    const limit  = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+    const pkrRate = parseFloat(process.env.PKR_RATE) || 280;
+
+    const [rows, cnt] = await Promise.all([
+      pool.query(
+        `SELECT d.id, d.task_date, d.status, d.reward_usdt, d.watch_duration_seconds,
+                d.completed_at, t.title, t.task_type, t.thumbnail_url
+         FROM daily_task_tracking d
+         JOIN tasks t ON t.id = d.task_id
+         WHERE d.user_id = $1 AND d.status = 'completed'
+         ORDER BY d.completed_at DESC NULLS LAST
+         LIMIT $2 OFFSET $3`,
+        [userId, limit, offset]
+      ),
+      pool.query(
+        `SELECT COUNT(*) AS cnt FROM daily_task_tracking WHERE user_id=$1 AND status='completed'`,
+        [userId]
+      )
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        tasks: rows.rows.map(r => ({
+          ...r,
+          reward_pkr: Math.round(parseFloat(r.reward_usdt) * pkrRate)
+        })),
+        pagination: {
+          page, limit,
+          total: parseInt(cnt.rows[0].cnt),
+          total_pages: Math.ceil(cnt.rows[0].cnt / limit)
+        }
+      }
+    });
+  } catch (err) {
+    console.error('My tasks error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch task history', error: err.message });
+  }
+});
+
+// GET /api/user/team-stats — referral team performance summary
+router.get('/team-stats', authenticate, async (req, res) => {
+  try {
+    const userId  = req.user.id;
+    const pkrRate = parseFloat(process.env.PKR_RATE) || 280;
+
+    const [l1, l2, l3, commissions] = await Promise.all([
+      pool.query(`SELECT COUNT(*) AS cnt FROM referrals WHERE referrer_id=$1 AND referral_level=1`, [userId]),
+      pool.query(`SELECT COUNT(*) AS cnt FROM referrals WHERE referrer_id=$1 AND referral_level=2`, [userId]),
+      pool.query(`SELECT COUNT(*) AS cnt FROM referrals WHERE referrer_id=$1 AND referral_level=3`, [userId]),
+      pool.query(
+        `SELECT COALESCE(SUM(amount_usdt),0) AS total FROM transactions
+         WHERE user_id=$1 AND type IN ('referral_commission','referral_bonus') AND status='completed'`,
+        [userId]
+      )
+    ]);
+
+    // Active referrals (logged in within 7 days)
+    const activeRes = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM referrals r
+       JOIN users u ON u.id = r.referred_id
+       WHERE r.referrer_id=$1 AND r.referral_level=1
+         AND u.last_login_at > NOW() - INTERVAL '7 days'`,
+      [userId]
+    );
+
+    // Commission by level
+    const byLevel = await pool.query(
+      `SELECT r.referral_level,
+              COALESCE(SUM(r.total_commission_usdt),0) AS commission
+       FROM referrals r WHERE r.referrer_id=$1
+       GROUP BY r.referral_level ORDER BY r.referral_level`,
+      [userId]
+    );
+
+    const levelMap = {};
+    byLevel.rows.forEach(r => { levelMap[r.referral_level] = parseFloat(r.commission); });
+
+    const totalComm = parseFloat(commissions.rows[0].total);
+
+    res.json({
+      success: true,
+      data: {
+        level1_count:   parseInt(l1.rows[0].cnt),
+        level2_count:   parseInt(l2.rows[0].cnt),
+        level3_count:   parseInt(l3.rows[0].cnt),
+        total_count:    parseInt(l1.rows[0].cnt) + parseInt(l2.rows[0].cnt) + parseInt(l3.rows[0].cnt),
+        active_7d:      parseInt(activeRes.rows[0].cnt),
+        total_commission_usdt: totalComm,
+        total_commission_pkr:  Math.round(totalComm * pkrRate),
+        l1_commission:  levelMap[1] || 0,
+        l2_commission:  levelMap[2] || 0,
+        l3_commission:  levelMap[3] || 0
+      }
+    });
+  } catch (err) {
+    console.error('Team stats error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch team stats', error: err.message });
+  }
+});

@@ -67,6 +67,7 @@ app.use('/api/vip',           require('./routes/vip'));
 app.use('/api/referral',      require('./routes/referral'));
 app.use('/api/notifications', require('./routes/notifications'));
 app.use('/api/spin',          require('./routes/spin'));
+app.use('/api/saved-methods', require('./routes/saved-methods'));
 app.use('/api/admin',         require('./routes/admin'));
 // v2.0 — all routes confirmed mounted
 app.get('/api/version', (req, res) => {

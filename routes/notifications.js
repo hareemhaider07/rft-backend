@@ -139,3 +139,21 @@ router.get('/announcements', authenticate, async (req, res) => {
 });
 
 module.exports = router;
+
+// ── GET /api/notifications/login-popup ───────────────────────────────────────
+// Returns the active login popup to show after login
+router.get('/login-popup', authenticate, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, title, content, image_url, button_text, button_url
+       FROM login_popups
+       WHERE is_active = true
+         AND (expires_at IS NULL OR expires_at > NOW())
+       ORDER BY created_at DESC LIMIT 1`
+    );
+    res.json({ success: true, data: r.rows[0] || null });
+  } catch (err) {
+    // Table may not exist yet — return null gracefully
+    res.json({ success: true, data: null });
+  }
+});

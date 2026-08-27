@@ -336,3 +336,34 @@ CREATE TRIGGER trg_users_updated_at           BEFORE UPDATE ON users           F
 CREATE TRIGGER trg_tasks_updated_at           BEFORE UPDATE ON tasks           FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER trg_transactions_updated_at    BEFORE UPDATE ON transactions    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER trg_payment_methods_updated_at BEFORE UPDATE ON payment_methods FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- =============================================
+-- SAVED PAYOUT METHODS TABLE
+-- =============================================
+CREATE TABLE IF NOT EXISTS saved_payout_methods (
+  id             UUID         PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id        UUID         REFERENCES users(id) ON DELETE CASCADE,
+  method_name    VARCHAR(50)  NOT NULL,
+  account_name   VARCHAR(255) NOT NULL,
+  account_number VARCHAR(255) NOT NULL,
+  is_default     BOOLEAN      DEFAULT false,
+  is_active      BOOLEAN      DEFAULT true,
+  created_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_saved_methods_user ON saved_payout_methods(user_id);
+
+-- =============================================
+-- LOGIN POPUPS TABLE (admin-managed notices)
+-- =============================================
+CREATE TABLE IF NOT EXISTS login_popups (
+  id         UUID         PRIMARY KEY DEFAULT uuid_generate_v4(),
+  title      VARCHAR(255) NOT NULL,
+  content    TEXT         NOT NULL,
+  image_url  VARCHAR(500),
+  button_text VARCHAR(100) DEFAULT 'Got it',
+  button_url  VARCHAR(500),
+  is_active  BOOLEAN      DEFAULT true,
+  show_once  BOOLEAN      DEFAULT false,
+  created_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  expires_at TIMESTAMP
+);
