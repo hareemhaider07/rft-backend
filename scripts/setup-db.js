@@ -86,8 +86,7 @@ async function run() {
            title         = $1,
            video_url     = $2,
            thumbnail_url = $3,
-           task_type     = 'youtube',
-           updated_at    = NOW()
+           task_type     = 'youtube'
          WHERE title = $4
          RETURNING title`,
         [t.new_title, t.video_url, t.thumbnail_url, t.old_title]

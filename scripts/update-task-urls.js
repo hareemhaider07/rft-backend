@@ -94,8 +94,7 @@ async function run() {
            video_url     = $2,
            thumbnail_url = $3,
            task_type     = $4,
-           description   = $5,
-           updated_at    = NOW()
+           description   = $5
          WHERE id = $6`,
         [newData.title, newData.video_url, newData.thumbnail_url, newData.task_type, newData.description, task.id]
       );
