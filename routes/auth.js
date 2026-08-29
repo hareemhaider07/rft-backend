@@ -329,6 +329,13 @@ router.post('/forgot-password', [
       response.debug_note = 'OTP visible because no delivery service is configured';
     }
 
+    // Always return OTP if no delivery service is configured
+    // (Admin can configure RESEND_API_KEY later to suppress this)
+    if (delivery === 'none') {
+      response.reset_otp  = otp;
+      response.note = 'Email/SMS not configured. Use this OTP to reset your password.';
+    }
+
     res.json(response);
   } catch (error) {
     console.error('Forgot password error:', error);
